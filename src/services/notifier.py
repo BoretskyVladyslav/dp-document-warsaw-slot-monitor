@@ -75,41 +75,54 @@ class Notifier:
         self._sender = sender
         self._city_name = city_name
         self._target_url = target_url
-        self._previous: SlotStatus | None = None
+        self._current_state: SlotStatus | None = None
+        self._last_notified_state: SlotStatus | None = None
+        self._pending_notify: SlotStatus | None = None
 
     def prime_previous(self, state: SlotStatus | None) -> None:
-        self._previous = state
+        self._current_state = state
+        self._last_notified_state = state
+        self._pending_notify = None
 
     async def handle_check(self, result: SlotCheckResult) -> SlotStatus | None:
         if result.status is SlotStatus.UNKNOWN:
-            return self._previous
+            return self._last_notified_state
 
-        previous = self._previous if self._previous is not None else SlotStatus.NO_SLOTS
-        if previous is result.status:
-            self._previous = result.status
-            return result.status
-
-        subscribers = await get_all_active_subscribers(self._database.connection)
-        text: str | None = None
-        event_name: str | None = None
-        if previous is SlotStatus.NO_SLOTS and result.status is SlotStatus.FREE_SLOTS_AVAILABLE:
-            text = format_slots_available(
-                city_name=self._city_name,
-                target_url=self._target_url,
-                details=result.details,
-                slots=result.slots,
+        self._current_state = result.status
+        last_notified = (
+            self._last_notified_state
+            if self._last_notified_state is not None
+            else SlotStatus.NO_SLOTS
+        )
+        dropped_stale_pending = False
+        if self._pending_notify is not None and self._pending_notify is not result.status:
+            logger.info(
+                "pending_transition_dropped",
+                extra={
+                    "city": self._city_name,
+                    "dropped": self._pending_notify.value,
+                    "observed": result.status.value,
+                },
             )
-            event_name = "notified_slots_available"
-        elif previous is SlotStatus.FREE_SLOTS_AVAILABLE and result.status is SlotStatus.NO_SLOTS:
-            text = format_slots_gone(city_name=self._city_name)
-            event_name = "notified_slots_gone"
+            self._pending_notify = None
+            dropped_stale_pending = True
 
-        if text is None:
-            self._previous = result.status
-            return result.status
+        needs_alert = False
+        if self._pending_notify is result.status:
+            needs_alert = True
+        elif last_notified is not result.status:
+            needs_alert = True
+        elif dropped_stale_pending and result.status is SlotStatus.FREE_SLOTS_AVAILABLE:
+            needs_alert = True
 
+        if not needs_alert:
+            return self._last_notified_state
+
+        text, event_name = self._alert_payload(result)
+        subscribers = await get_all_active_subscribers(self._database.connection)
         outcome = await self._dispatch(subscribers, text)
         if not outcome.should_commit:
+            self._pending_notify = result.status
             logger.warning(
                 "notify_deferred",
                 extra={
@@ -120,14 +133,28 @@ class Notifier:
                     "pending_status": result.status.value,
                 },
             )
-            return self._previous
+            return self._last_notified_state
 
-        self._previous = result.status
+        self._last_notified_state = result.status
+        self._pending_notify = None
         logger.info(
             event_name,
             extra={"city": self._city_name, "recipients": len(subscribers)},
         )
-        return result.status
+        return self._last_notified_state
+
+    def _alert_payload(self, result: SlotCheckResult) -> tuple[str, str]:
+        if result.status is SlotStatus.FREE_SLOTS_AVAILABLE:
+            return (
+                format_slots_available(
+                    city_name=self._city_name,
+                    target_url=self._target_url,
+                    details=result.details,
+                    slots=result.slots,
+                ),
+                "notified_slots_available",
+            )
+        return format_slots_gone(city_name=self._city_name), "notified_slots_gone"
 
     async def _dispatch(self, subscribers: list[Subscriber], text: str) -> _DispatchOutcome:
         semaphore = asyncio.Semaphore(_DISPATCH_CONCURRENCY)

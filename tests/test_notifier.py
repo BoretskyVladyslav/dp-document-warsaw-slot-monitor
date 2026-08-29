@@ -26,6 +26,19 @@ class _FailingSender:
         raise RecipientUnreachableError(chat_id)
 
 
+class _SequenceSender:
+    def __init__(self, fail_on_calls: frozenset[int]) -> None:
+        self._fail_on_calls = fail_on_calls
+        self.calls = 0
+        self.sent: list[str] = []
+
+    async def send(self, chat_id: int, text: str) -> None:
+        self.calls += 1
+        if self.calls in self._fail_on_calls:
+            raise DeliveryError(chat_id, reason="telegram network error")
+        self.sent.append(text)
+
+
 class _PerChatSender:
     def __init__(self, failures: dict[int, BaseException]) -> None:
         self._failures = failures
@@ -179,11 +192,18 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sender.sent, [200])
 
 
-    def _free_result(self) -> SlotCheckResult:
+    def _free_result(self, slot: str = "2099-09-10") -> SlotCheckResult:
         return SlotCheckResult(
             status=SlotStatus.FREE_SLOTS_AVAILABLE,
             checked_at=datetime.now(timezone.utc),
-            slots=("2099-09-10",),
+            details=slot,
+            slots=(slot,),
+        )
+
+    def _gone_result(self) -> SlotCheckResult:
+        return SlotCheckResult(
+            status=SlotStatus.NO_SLOTS,
+            checked_at=datetime.now(timezone.utc),
         )
 
     async def test_all_transient_failures_keep_state_for_retry(self) -> None:
@@ -219,6 +239,30 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, SlotStatus.FREE_SLOTS_AVAILABLE)
         second = await notifier.handle_check(self._free_result())
         self.assertEqual(second, SlotStatus.FREE_SLOTS_AVAILABLE)
+
+    async def test_oscillation_drops_stale_gone_and_sends_fresh_free(self) -> None:
+        sender = _SequenceSender(fail_on_calls=frozenset({2}))
+        notifier = Notifier(
+            database=self.db,
+            sender=sender,
+            city_name="Warsaw",
+            target_url="https://example.test/queue",
+        )
+        first = await notifier.handle_check(self._free_result("2099-09-10"))
+        self.assertEqual(first, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(len(sender.sent), 1)
+        self.assertIn("2099-09-10", sender.sent[0])
+
+        deferred = await notifier.handle_check(self._gone_result())
+        self.assertEqual(deferred, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(len(sender.sent), 1)
+        self.assertTrue(all("зайняті" not in text for text in sender.sent))
+
+        reconciled = await notifier.handle_check(self._free_result("2099-09-11"))
+        self.assertEqual(reconciled, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(len(sender.sent), 2)
+        self.assertIn("2099-09-11", sender.sent[1])
+        self.assertTrue(all("зайняті" not in text for text in sender.sent))
 
 
 if __name__ == "__main__":
