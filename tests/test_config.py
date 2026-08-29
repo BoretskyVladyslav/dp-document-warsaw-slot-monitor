@@ -16,6 +16,14 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.check_interval_seconds, 180)
         self.assertTrue(settings.headless)
 
+    def test_parses_single_admin_id_as_list(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            admin_ids=42,
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+        )
+        self.assertEqual(settings.admin_ids, [42])
+
     def test_empty_proxy_becomes_none(self) -> None:
         settings = Settings(
             bot_token="1234567890:TESTTOKENVALUE",

@@ -34,6 +34,8 @@ class Settings(BaseSettings):
             return []
         if isinstance(value, str):
             return [int(part.strip()) for part in value.split(",") if part.strip()]
+        if isinstance(value, int):
+            return [value]
         return value
 
     @field_validator("proxy_url", "service_option", mode="before")
