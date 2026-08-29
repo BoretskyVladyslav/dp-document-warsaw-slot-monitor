@@ -138,6 +138,64 @@ class ParseSlotPageTests(unittest.TestCase):
         )
         self.assertEqual(result.status, SlotStatus.NO_SLOTS)
 
+    def test_live_ui_occupied_message(self) -> None:
+        html = """
+        <div class="e-queue">
+          <h2>Наразі всі місця зайняті</h2>
+          <p>Будь ласка, спробуйте в інший час або день</p>
+        </div>
+        """
+        result = parse_slot_page(
+            html=html,
+            title="Електронна черга",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.NO_SLOTS)
+
+    def test_live_ui_booking_form_is_free(self) -> None:
+        html = """
+        <form class="e-queue-booking">
+          <label>Послуга</label>
+          <select name="service">
+            <option value="">- Обрати -</option>
+            <option value="passport">Оформлення паспорта</option>
+          </select>
+          <label>Телефон</label>
+          <input type="tel" name="phone" placeholder="+48">
+        </form>
+        """
+        result = parse_slot_page(
+            html=html,
+            title="Електронна черга",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+
+    def test_phone_input_without_occupied_is_free(self) -> None:
+        result = parse_slot_page(
+            html='<form><input type="tel" name="phone"></form>',
+            title="Електронна черга",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+
+    def test_occupied_message_wins_over_form_fields(self) -> None:
+        html = """
+        <h2>Наразі всі місця зайняті</h2>
+        <p>Будь ласка, спробуйте в інший час або день</p>
+        <input type="tel" name="phone">
+        """
+        result = parse_slot_page(
+            html=html,
+            title="Електронна черга",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.NO_SLOTS)
+
 
 if __name__ == "__main__":
     unittest.main()

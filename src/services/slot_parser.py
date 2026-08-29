@@ -7,7 +7,13 @@ from typing import Any
 
 from src.core.models import SlotCheckResult, SlotStatus
 
+OCCUPIED_PHRASES: tuple[str, ...] = (
+    "наразі всі місця зайняті",
+    "будь ласка, спробуйте в інший час або день",
+)
+
 NO_SLOT_PHRASES: tuple[str, ...] = (
+    *OCCUPIED_PHRASES,
     "немає вільних",
     "немає доступних",
     "немає вільних дат",
@@ -25,6 +31,14 @@ NO_SLOT_PHRASES: tuple[str, ...] = (
     "вільних талонів немає",
     "no dates available",
 )
+
+_SERVICE_LABEL = "послуга"
+_SELECT_PLACEHOLDER = "- обрати -"
+_TEL_INPUT_RE = re.compile(
+    r"""<input\b[^>]*\btype\s*=\s*["']tel["']""",
+    re.IGNORECASE,
+)
+_SELECT_TAG_RE = re.compile(r"<select\b", re.IGNORECASE)
 
 _CF_TITLE_MARKERS: tuple[str, ...] = (
     "just a moment",
@@ -72,6 +86,14 @@ def parse_slot_page(
             details="Cloudflare challenge page detected",
         )
 
+    normalized = _normalize_ui_text(html)
+    if _has_occupied_message(normalized):
+        return SlotCheckResult(
+            status=SlotStatus.NO_SLOTS,
+            checked_at=moment,
+            details="occupied message: Наразі всі місця зайняті",
+        )
+
     json_slots, json_explicit_empty = _extract_slots_from_payloads(json_payloads)
     dom_slots = _extract_slots_from_html(html)
     slots = tuple(dict.fromkeys([*json_slots, *dom_slots]))
@@ -85,8 +107,14 @@ def parse_slot_page(
             slots=slots,
         )
 
-    lowered = html.lower()
-    if json_explicit_empty or any(phrase in lowered for phrase in NO_SLOT_PHRASES):
+    if _has_booking_form(html, normalized):
+        return SlotCheckResult(
+            status=SlotStatus.FREE_SLOTS_AVAILABLE,
+            checked_at=moment,
+            details="booking form visible (Послуга / phone)",
+        )
+
+    if json_explicit_empty or any(phrase in normalized for phrase in NO_SLOT_PHRASES):
         return SlotCheckResult(
             status=SlotStatus.NO_SLOTS,
             checked_at=moment,
@@ -98,6 +126,23 @@ def parse_slot_page(
         checked_at=moment,
         details="page did not contain a conclusive slot signal",
     )
+
+
+def _normalize_ui_text(html: str) -> str:
+    lowered = html.lower()
+    return lowered.replace("–", "-").replace("—", "-").replace("−", "-")
+
+
+def _has_occupied_message(normalized_html: str) -> bool:
+    return any(phrase in normalized_html for phrase in OCCUPIED_PHRASES)
+
+
+def _has_booking_form(html: str, normalized_html: str) -> bool:
+    has_placeholder = _SELECT_PLACEHOLDER in normalized_html
+    has_service_label = _SERVICE_LABEL in normalized_html
+    has_tel = bool(_TEL_INPUT_RE.search(html))
+    has_select = bool(_SELECT_TAG_RE.search(html))
+    return has_tel or (has_select and has_placeholder) or (has_service_label and has_placeholder)
 
 
 def _extract_slots_from_payloads(payloads: list[Any]) -> tuple[list[str], bool]:
