@@ -47,19 +47,12 @@ STEALTH_INIT_SCRIPT = """
 CLOUDFLARE_CLEARED_JS = """
 () => {
   const title = (document.title || '').toLowerCase();
-  const body = (document.body && document.body.innerText || '').toLowerCase();
-  const html = (document.documentElement && document.documentElement.innerHTML || '').toLowerCase();
-  const blob = title + ' ' + body + ' ' + html;
-  const markers = [
-    'just a moment',
-    'checking your browser',
-    'attention required',
-    'cf-browser-verification',
-    'challenge-platform',
-    'cf-challenge',
-    'cdn-cgi/challenge',
-  ];
-  return !markers.some((marker) => blob.includes(marker));
+  if (['just a moment', 'checking your browser', 'attention required'].some((m) => title.includes(m))) {
+    return false;
+  }
+  const overlay = document.querySelector('#challenge-running, #cf-spinner, .cf-browser-verification');
+  if (overlay) return false;
+  return true;
 }
 """
 

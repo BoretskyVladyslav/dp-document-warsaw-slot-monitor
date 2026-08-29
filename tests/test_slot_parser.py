@@ -56,6 +56,54 @@ class ParseSlotPageTests(unittest.TestCase):
         self.assertEqual(result.status, SlotStatus.UNKNOWN)
         self.assertEqual(result.error, "cloudflare_challenge")
 
+    def test_turnstile_iframe_alone_is_not_challenge(self) -> None:
+        result = parse_slot_page(
+            html='<iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile"></iframe><p>немає вільних дат</p>',
+            title="Електронна черга",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.NO_SLOTS)
+
+    def test_is_not_disabled_calendar_day(self) -> None:
+        result = parse_slot_page(
+            html='<td class="vc-day is-not-disabled" data-date="2099-12-15">15</td>',
+            title="Queue",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertIn("2099-12-15", result.slots)
+
+    def test_data_available_inner_date(self) -> None:
+        result = parse_slot_page(
+            html='<button data-available="true">2099-08-20 09:30</button>',
+            title="Queue",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertTrue(any("2099-08-20" in item for item in result.slots))
+
+    def test_calendar_available_class(self) -> None:
+        result = parse_slot_page(
+            html='<td class="calendar-day is-available" data-date="2099-12-01">1</td>',
+            title="Queue",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertIn("2099-12-01", result.slots)
+
+    def test_no_slots_places_phrase(self) -> None:
+        result = parse_slot_page(
+            html="<p>На жаль, немає вільних місць</p>",
+            title="Черга",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.NO_SLOTS)
+
 
 if __name__ == "__main__":
     unittest.main()

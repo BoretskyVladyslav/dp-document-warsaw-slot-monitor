@@ -20,16 +20,20 @@ NO_SLOT_PHRASES: tuple[str, ...] = (
     "currently no available",
     "brak wolnych",
     "brak dostępnych",
+    "немає вільних місць",
+    "немає доступних дат",
+    "вільних талонів немає",
+    "no dates available",
 )
 
-CLOUDFLARE_MARKERS: tuple[str, ...] = (
-    "cf-browser-verification",
-    "challenge-platform",
+_CF_TITLE_MARKERS: tuple[str, ...] = (
     "just a moment",
     "checking your browser",
     "attention required",
-    "cf-challenge",
-    "cdn-cgi/challenge",
+)
+_CF_OVERLAY_MARKERS: tuple[str, ...] = (
+    "cf-browser-verification",
+    "challenge-running",
 )
 
 _DATE_RE = re.compile(
@@ -39,8 +43,11 @@ _TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
 
 
 def is_cloudflare_challenge(*, title: str, html: str) -> bool:
-    blob = f"{title} {html}".lower()
-    return any(marker in blob for marker in CLOUDFLARE_MARKERS)
+    title_l = title.lower()
+    if any(marker in title_l for marker in _CF_TITLE_MARKERS):
+        return True
+    html_l = html.lower()
+    return any(marker in html_l for marker in _CF_OVERLAY_MARKERS)
 
 
 def parse_slot_page(
@@ -161,7 +168,7 @@ def _parse_date(raw: str) -> date | None:
 def _extract_slots_from_html(html: str) -> list[str]:
     slots: list[str] = []
     attr_pattern = re.compile(
-        r"""(?:data-date|data-day|data-time|data-slot)\s*=\s*["']([^"']+)["']""",
+        r"""(?:data-date|data-day|data-time|data-slot|data-day-value)\s*=\s*["']([^"']+)["']""",
         re.IGNORECASE,
     )
     for match in attr_pattern.finditer(html):
@@ -169,13 +176,40 @@ def _extract_slots_from_html(html: str) -> list[str]:
         if _looks_like_slot(value):
             slots.append(value)
 
+    available_attr = re.compile(
+        r"""<(?:button|td|div|span|a)[^>]*data-available\s*=\s*["']true["'][^>]*>(.*?)</(?:button|td|div|span|a)>""",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in available_attr.finditer(html):
+        extracted = _dates_and_times_from_text(match.group(0) + " " + match.group(1))
+        slots.extend(extracted)
+
     class_available = re.compile(
-        r"""<(?:button|td|div|span)[^>]*class=["'][^"']*\b(?:available|free|enabled)\b[^"']*["'][^>]*>(.*?)</(?:button|td|div|span)>""",
+        r"""<(?:button|td|div|span|a)[^>]*class=["'][^"']*\b(?:available|free|enabled|is-available|day-available|has-slots|is-not-disabled)\b[^"']*["'][^>]*>(.*?)</(?:button|td|div|span|a)>""",
         re.IGNORECASE | re.DOTALL,
     )
     for match in class_available.finditer(html):
+        tag = match.group(0)
+        if re.search(r"""aria-disabled\s*=\s*["']true["']""", tag, re.IGNORECASE):
+            continue
+        if re.search(r"""\sdisabled(?:\s|>|/|=)""", tag, re.IGNORECASE):
+            continue
         text = re.sub(r"<[^>]+>", " ", match.group(1))
         extracted = _dates_and_times_from_text(text)
+        slots.extend(extracted)
+
+    aria_date = re.compile(
+        r"""<(?:button|td|div)[^>]*aria-label=["']([^"']+)["'][^>]*(?:aria-disabled=["']false["'])?[^>]*>""",
+        re.IGNORECASE,
+    )
+    for match in aria_date.finditer(html):
+        label = match.group(1)
+        tag = match.group(0)
+        if re.search(r"""aria-disabled\s*=\s*["']true["']""", tag, re.IGNORECASE):
+            continue
+        if re.search(r"""\sdisabled(?:\s|>|/|=)""", tag, re.IGNORECASE):
+            continue
+        extracted = _dates_and_times_from_text(label)
         slots.extend(extracted)
 
     return [item for item in slots if _is_future_or_today(item.split()[0] if item else None)]

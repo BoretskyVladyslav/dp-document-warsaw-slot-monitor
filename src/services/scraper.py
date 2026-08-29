@@ -4,9 +4,10 @@ import asyncio
 import logging
 import random
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from playwright.async_api import Browser, BrowserContext, Page, Playwright
+from playwright.async_api import BrowserContext, Page, Playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -19,8 +20,17 @@ from src.services.stealth import CHROME_CLIENT_HINTS, CLOUDFLARE_CLEARED_JS, STE
 
 logger = logging.getLogger(__name__)
 
-_MAX_ATTEMPTS = 3
-_CLOUDFLARE_WAIT_MS = 25_000
+_MAX_ATTEMPTS = 2
+_CLOUDFLARE_WAIT_MS = 45_000
+_LAUNCH_ARGS: list[str] = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-infobars",
+    "--window-size=1920,1080",
+]
 
 
 async def _human_pause(min_s: float = 0.4, max_s: float = 1.8) -> None:
@@ -31,50 +41,66 @@ class SlotScraper:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._playwright: Playwright | None = None
-        self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        self._browser_channel: str = "chromium"
 
     async def start(self) -> None:
-        if self._browser is not None:
+        if self._context is not None:
             return
         self._playwright = await async_playwright().start()
-        launch_kwargs: dict[str, Any] = {
-            "headless": self._settings.headless,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-infobars",
-                "--window-size=1920,1080",
-            ],
-            "ignore_default_args": ["--enable-automation"],
-        }
-        if self._settings.proxy_url:
-            launch_kwargs["proxy"] = {"server": self._settings.proxy_url}
-        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-        self._context = await self._browser.new_context(
-            user_agent=self._settings.user_agent,
-            locale="uk-UA",
-            timezone_id="Europe/Warsaw",
-            viewport={"width": 1920, "height": 1080},
-            screen={"width": 1920, "height": 1080},
-            color_scheme="light",
-            java_script_enabled=True,
-            extra_http_headers=CHROME_CLIENT_HINTS,
-        )
+        profile = Path(self._settings.browser_profile_dir)
+        profile.mkdir(parents=True, exist_ok=True)
+        context_kwargs = self._context_kwargs(str(profile))
+        try:
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                **context_kwargs,
+                channel="chrome",
+            )
+            self._browser_channel = "chrome"
+        except PlaywrightError as exc:
+            logger.warning(
+                "system_chrome_unavailable",
+                extra={"error": str(exc)},
+            )
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                **context_kwargs,
+            )
+            self._browser_channel = "chromium"
         await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+        for existing in list(self._context.pages):
+            await existing.close()
         logger.info(
             "scraper_started",
-            extra={"city": self._settings.city_name, "headless": self._settings.headless},
+            extra={
+                "city": self._settings.city_name,
+                "headless": self._settings.headless,
+                "channel": self._browser_channel,
+            },
         )
+
+    def _context_kwargs(self, user_data_dir: str) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "user_data_dir": user_data_dir,
+            "headless": self._settings.headless,
+            "args": list(_LAUNCH_ARGS),
+            "ignore_default_args": ["--enable-automation"],
+            "user_agent": self._settings.user_agent,
+            "locale": "uk-UA",
+            "timezone_id": "Europe/Warsaw",
+            "viewport": {"width": 1920, "height": 1080},
+            "screen": {"width": 1920, "height": 1080},
+            "color_scheme": "light",
+            "java_script_enabled": True,
+            "extra_http_headers": CHROME_CLIENT_HINTS,
+        }
+        if self._settings.proxy_url:
+            kwargs["proxy"] = {"server": self._settings.proxy_url}
+        return kwargs
 
     async def stop(self) -> None:
         if self._context is not None:
             await self._context.close()
             self._context = None
-        if self._browser is not None:
-            await self._browser.close()
-            self._browser = None
         if self._playwright is not None:
             await self._playwright.stop()
             self._playwright = None
@@ -105,7 +131,6 @@ class SlotScraper:
                     error="cloudflare_challenge",
                     details=str(exc),
                 )
-                await self._reset()
             except (NetworkTimeoutError, PlaywrightTimeoutError) as exc:
                 logger.warning(
                     "scraper_timeout",
@@ -121,7 +146,6 @@ class SlotScraper:
                     error="timeout",
                     details=str(exc),
                 )
-                await self._reset()
             except (ScraperError, PlaywrightError, OSError) as exc:
                 logger.exception(
                     "scraper_failed",
@@ -139,7 +163,7 @@ class SlotScraper:
                 )
                 await self._reset()
             if attempt < _MAX_ATTEMPTS:
-                delay = (2 ** attempt) + random.uniform(0.3, 1.4)
+                delay = 3.0 + random.uniform(0.4, 1.6)
                 logger.info(
                     "scraper_retry",
                     extra={"city": self._settings.city_name, "attempt": attempt, "delay": round(delay, 2)},
@@ -204,23 +228,22 @@ class SlotScraper:
     async def _wait_out_cloudflare(self, page: Page, nav_timeout: int) -> None:
         title = await page.title()
         html = await page.content()
-        if not is_cloudflare_challenge(title=title, html=html):
+        html_l = html.lower()
+        has_widget = "challenges.cloudflare.com" in html_l or "cf-turnstile" in html_l
+        if not is_cloudflare_challenge(title=title, html=html) and not has_widget:
             return
-        logger.info("cloudflare_wait", extra={"city": self._settings.city_name})
+        logger.info(
+            "cloudflare_wait",
+            extra={"city": self._settings.city_name, "timeout_ms": _CLOUDFLARE_WAIT_MS},
+        )
         try:
             await page.wait_for_function(CLOUDFLARE_CLEARED_JS, timeout=_CLOUDFLARE_WAIT_MS)
             await page.wait_for_load_state("domcontentloaded", timeout=nav_timeout)
-            await _human_pause(0.6, 1.8)
-            return
-        except PlaywrightTimeoutError:
-            logger.info("cloudflare_reload", extra={"city": self._settings.city_name})
-        try:
-            await page.reload(wait_until="domcontentloaded", timeout=nav_timeout)
-            await _human_pause(1.2, 2.8)
-            await page.wait_for_function(CLOUDFLARE_CLEARED_JS, timeout=_CLOUDFLARE_WAIT_MS)
-            await page.wait_for_load_state("domcontentloaded", timeout=nav_timeout)
+            await _human_pause(0.8, 2.0)
         except PlaywrightTimeoutError as exc:
-            raise CloudflareChallengeError("Cloudflare challenge did not clear after wait/reload") from exc
+            raise CloudflareChallengeError(
+                "Cloudflare/Turnstile challenge did not complete within the wait window"
+            ) from exc
 
     async def _select_service(self, page: Page) -> None:
         label = self._settings.service_option

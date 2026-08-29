@@ -24,6 +24,14 @@ class SettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.admin_ids, [42])
 
+    def test_headless_false_from_bool(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            headless=False,
+        )
+        self.assertFalse(settings.headless)
+
     def test_empty_proxy_becomes_none(self) -> None:
         settings = Settings(
             bot_token="1234567890:TESTTOKENVALUE",
