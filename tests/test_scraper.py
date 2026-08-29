@@ -64,7 +64,7 @@ class ScraperHelperTests(unittest.TestCase):
         )
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as handle:
             path = Path(handle.name)
-            handle.write(b"{}")
+            handle.write(b'{"cookies":[{"name":"cf_clearance","value":"x"}],"origins":[]}')
         try:
             kwargs = worker_context_kwargs(settings, path)
             self.assertEqual(kwargs["storage_state"], str(path))

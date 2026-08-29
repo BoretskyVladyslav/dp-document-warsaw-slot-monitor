@@ -18,6 +18,7 @@ from src.core.exceptions import NetworkTimeoutError, ScraperError, SessionExpire
 from src.core.models import SlotCheckResult, SlotStatus
 from src.services.slot_parser import dumps_payload, is_cloudflare_challenge, parse_slot_page
 from src.services.stealth import CHROME_CLIENT_HINTS, STEALTH_INIT_SCRIPT, stealth_async
+from src.services.storage_state import is_usable_storage_state
 
 logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -80,7 +81,7 @@ def worker_context_kwargs(settings: Settings, storage_path: Path) -> dict[str, A
         kwargs["screen"] = {"width": 1920, "height": 1080}
     else:
         kwargs["no_viewport"] = True
-    if storage_path.is_file():
+    if is_usable_storage_state(storage_path):
         kwargs["storage_state"] = str(storage_path)
     if settings.proxy_url:
         kwargs["proxy"] = {"server": settings.proxy_url}
@@ -120,7 +121,7 @@ class SlotScraper:
                 "headless": self._settings.headless,
                 "channel": self._browser_channel,
                 "storage_state": str(storage),
-                "storage_state_exists": storage.is_file(),
+                "storage_state_exists": is_usable_storage_state(storage),
             },
         )
 
