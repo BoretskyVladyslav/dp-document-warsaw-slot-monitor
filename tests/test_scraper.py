@@ -5,9 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src.core.exceptions import ScraperError
 from src.core.config import Settings
 from src.services.scraper import (
     SlotScraper,
+    cdp_tab_matches,
     chrome_launch_args,
     has_cf_clearance_cookie,
     is_target_closed_error,
@@ -132,6 +134,13 @@ class CdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page_matches_target_url("https://example.com/solutions/e-queue", target))
         self.assertFalse(page_matches_target_url("about:blank", target))
 
+    def test_cdp_tab_matches_pasport_host(self) -> None:
+        target = "https://warszawa.pasport.org.ua/solutions/e-queue"
+        self.assertTrue(cdp_tab_matches("https://warszawa.pasport.org.ua/other", target))
+        self.assertTrue(cdp_tab_matches(target, target))
+        self.assertFalse(cdp_tab_matches("about:blank", target))
+        self.assertFalse(cdp_tab_matches("https://example.com/", target))
+
     async def test_stop_does_not_close_cdp_browser(self) -> None:
         settings = Settings(
             bot_token="1234567890:TESTTOKENVALUE",
@@ -186,7 +195,7 @@ class CdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(close_context)
         self.assertEqual(context.new_page_calls, 0)
 
-    async def test_cdp_open_page_does_not_close_user_context(self) -> None:
+    async def test_cdp_missing_queue_tab_does_not_spawn_blank(self) -> None:
         settings = Settings(
             bot_token="1234567890:TESTTOKENVALUE",
             target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
@@ -199,12 +208,51 @@ class CdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         browser.contexts = [context]
         scraper._browser = browser  # type: ignore[assignment]
         scraper._cdp_attached = True
-        opened_context, _page, close_page, close_context = await scraper._open_worker_page()
-        self.assertIs(opened_context, context)
-        self.assertTrue(close_page)
+        with self.assertRaises(ScraperError):
+            await scraper._open_worker_page()
+        self.assertEqual(context.new_page_calls, 0)
+        self.assertEqual(len(context.pages), 1)
+
+    async def test_cdp_reuses_pasport_host_tab(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            cdp_url="http://127.0.0.1:9222",
+            _env_file=None,
+        )
+        scraper = SlotScraper(settings)
+        keep = FakePage("https://warszawa.pasport.org.ua/")
+        context = FakeContext([FakePage("https://example.com/"), keep])
+        browser = FakeBrowser()
+        browser.contexts = [context]
+        scraper._browser = browser  # type: ignore[assignment]
+        scraper._cdp_attached = True
+        _ctx, page, close_page, close_context = await scraper._open_worker_page()
+        self.assertIs(page, keep)
+        self.assertFalse(close_page)
         self.assertFalse(close_context)
-        self.assertEqual(context.new_page_calls, 1)
-        self.assertEqual(len(context.pages), 2)
+        self.assertEqual(context.new_page_calls, 0)
+
+    async def test_cdp_prefers_target_url_over_other_pasport_tabs(self) -> None:
+        target = "https://warszawa.pasport.org.ua/solutions/e-queue"
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url=target,
+            cdp_url="http://127.0.0.1:9222",
+            _env_file=None,
+        )
+        scraper = SlotScraper(settings)
+        other = FakePage("https://warszawa.pasport.org.ua/")
+        keep = FakePage(target)
+        context = FakeContext([other, keep])
+        browser = FakeBrowser()
+        browser.contexts = [context]
+        scraper._browser = browser  # type: ignore[assignment]
+        scraper._cdp_attached = True
+        _ctx, page, close_page, _close_context = await scraper._open_worker_page()
+        self.assertIs(page, keep)
+        self.assertFalse(close_page)
+        self.assertEqual(context.new_page_calls, 0)
 
 
 if __name__ == "__main__":
