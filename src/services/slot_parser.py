@@ -40,6 +40,11 @@ _DATE_RE = re.compile(
     r"\b(\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4}|\d{2}/\d{2}/\d{4})\b"
 )
 _TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
+_ARIA_DISABLED_TRUE_RE = re.compile(
+    r"""aria-disabled\s*=\s*["']true["']""",
+    re.IGNORECASE,
+)
+_DISABLED_ATTR_RE = re.compile(r"""(?:\s|<)disabled(?:\s|>|/|=)""", re.IGNORECASE)
 
 
 def is_cloudflare_challenge(*, title: str, html: str) -> bool:
@@ -165,6 +170,10 @@ def _parse_date(raw: str) -> date | None:
     return None
 
 
+def _is_disabled_element(tag: str) -> bool:
+    return bool(_ARIA_DISABLED_TRUE_RE.search(tag) or _DISABLED_ATTR_RE.search(tag))
+
+
 def _extract_slots_from_html(html: str) -> list[str]:
     slots: list[str] = []
     attr_pattern = re.compile(
@@ -181,7 +190,10 @@ def _extract_slots_from_html(html: str) -> list[str]:
         re.IGNORECASE | re.DOTALL,
     )
     for match in available_attr.finditer(html):
-        extracted = _dates_and_times_from_text(match.group(0) + " " + match.group(1))
+        tag = match.group(0)
+        if _is_disabled_element(tag):
+            continue
+        extracted = _dates_and_times_from_text(tag + " " + match.group(1))
         slots.extend(extracted)
 
     class_available = re.compile(
@@ -190,9 +202,7 @@ def _extract_slots_from_html(html: str) -> list[str]:
     )
     for match in class_available.finditer(html):
         tag = match.group(0)
-        if re.search(r"""aria-disabled\s*=\s*["']true["']""", tag, re.IGNORECASE):
-            continue
-        if re.search(r"""\sdisabled(?:\s|>|/|=)""", tag, re.IGNORECASE):
+        if _is_disabled_element(tag):
             continue
         text = re.sub(r"<[^>]+>", " ", match.group(1))
         extracted = _dates_and_times_from_text(text)
@@ -205,9 +215,7 @@ def _extract_slots_from_html(html: str) -> list[str]:
     for match in aria_date.finditer(html):
         label = match.group(1)
         tag = match.group(0)
-        if re.search(r"""aria-disabled\s*=\s*["']true["']""", tag, re.IGNORECASE):
-            continue
-        if re.search(r"""\sdisabled(?:\s|>|/|=)""", tag, re.IGNORECASE):
+        if _is_disabled_element(tag):
             continue
         extracted = _dates_and_times_from_text(label)
         slots.extend(extracted)

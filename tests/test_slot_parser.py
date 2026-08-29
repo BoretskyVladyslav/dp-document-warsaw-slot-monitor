@@ -85,6 +85,30 @@ class ParseSlotPageTests(unittest.TestCase):
         self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
         self.assertTrue(any("2099-08-20" in item for item in result.slots))
 
+    def test_data_available_disabled_ignored(self) -> None:
+        result = parse_slot_page(
+            html='<button disabled data-available="true">2099-08-20 09:30</button>',
+            title="Queue",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertNotEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertFalse(any("2099-08-20" in item for item in result.slots))
+
+    def test_data_available_aria_disabled_ignored(self) -> None:
+        result = parse_slot_page(
+            html=(
+                '<button aria-disabled="true" data-available="true">2099-08-20 09:30</button>'
+                '<button data-available="true">2099-08-21 10:00</button>'
+            ),
+            title="Queue",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertFalse(any("2099-08-20" in item for item in result.slots))
+        self.assertTrue(any("2099-08-21" in item for item in result.slots))
+
     def test_calendar_available_class(self) -> None:
         result = parse_slot_page(
             html='<td class="calendar-day is-available" data-date="2099-12-01">1</td>',
