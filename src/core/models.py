@@ -11,6 +11,35 @@ class SlotStatus(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class ScraperFailureCode(StrEnum):
+    CDP_UNAVAILABLE = "cdp_unavailable"
+    TARGET_TAB_MISSING = "target_tab_missing"
+    TARGET_TAB_CLOSED = "target_tab_closed"
+    CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
+    NAVIGATION_TIMEOUT = "navigation_timeout"
+    INCONCLUSIVE_PAGE = "inconclusive_page"
+    SCRAPER_ERROR = "scraper_error"
+
+
+class ScraperHealthStatus(StrEnum):
+    STOPPED = "STOPPED"
+    STARTING = "STARTING"
+    READY = "READY"
+    NEEDS_HUMAN = "NEEDS_HUMAN"
+    DEGRADED = "DEGRADED"
+
+
+class NotificationEventType(StrEnum):
+    SLOTS_AVAILABLE = "SLOTS_AVAILABLE"
+    HUMAN_ACTION_REQUIRED = "HUMAN_ACTION_REQUIRED"
+
+
+class DeliveryStatus(StrEnum):
+    PENDING = "PENDING"
+    DELIVERED = "DELIVERED"
+    UNREACHABLE = "UNREACHABLE"
+
+
 @dataclass(frozen=True, slots=True)
 class Subscriber:
     user_id: int
@@ -27,6 +56,48 @@ class SlotCheckResult:
     details: str = ""
     slots: tuple[str, ...] = ()
     error: str | None = None
+    failure_code: ScraperFailureCode | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScraperHealthSnapshot:
+    status: ScraperHealthStatus
+    cdp_connected: bool
+    target_tab_present: bool
+    updated_at: datetime
+    failure_code: ScraperFailureCode | None = None
+    details: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorStateRecord:
+    city_key: str
+    verified_state: SlotStatus
+    last_verified_at: datetime | None
+    last_attempt_at: datetime | None
+    last_details: str
+    last_error: str | None
+    human_action_incident_key: str | None
+    human_action_incident_notified_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationRecipient:
+    chat_id: int
+    user_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingNotificationDelivery:
+    event_id: int
+    event_key: str
+    event_type: NotificationEventType
+    city_key: str
+    chat_id: int
+    user_id: int | None
+    text: str
+    attempts: int
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,3 +111,6 @@ class MonitorSnapshot:
     city_name: str
     target_url: str
     slots: tuple[str, ...] = field(default_factory=tuple)
+    last_attempt_at: datetime | None = None
+    last_verified_at: datetime | None = None
+    scraper_health: ScraperHealthSnapshot | None = None

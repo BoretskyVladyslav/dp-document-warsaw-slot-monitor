@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.core.models import MonitorSnapshot
+from src.core.models import MonitorSnapshot, SlotCheckResult
 from src.services.monitor import SlotMonitor
 
 
@@ -10,3 +10,6 @@ class StatusService:
 
     async def get_snapshot(self) -> MonitorSnapshot:
         return await self._monitor.snapshot()
+
+    async def check_now(self) -> SlotCheckResult:
+        return await self._monitor.check_now()

@@ -3,22 +3,38 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
 
-from src.core.exceptions import DeliveryError, RecipientUnreachableError
-from src.core.models import SlotCheckResult, SlotStatus, Subscriber
+import aiosqlite
+
+from src.core.exceptions import (
+    DeliveryError,
+    HumanActionRequiredError,
+    RecipientUnreachableError,
+)
+from src.core.models import (
+    NotificationRecipient,
+    PendingNotificationDelivery,
+    ScraperFailureCode,
+    SlotCheckResult,
+    SlotStatus,
+)
 from src.core.protocols import MessageSender
 from src.database.connection import Database
-from src.database.subscribers import get_all_active_subscribers, remove_subscriber
-
-SESSION_EXPIRED_ALERT = (
-    "⚠️ Сесія Cloudflare застаріла. "
-    "Будь ласка, запустіть scripts/solve_session.py для оновлення."
+from src.database.notification_outbox import (
+    list_pending_deliveries,
+    mark_delivery_delivered,
+    mark_delivery_failed,
+    mark_delivery_unreachable,
+    persist_human_action_incident,
+    persist_verified_result,
 )
+from src.database.subscribers import remove_subscriber
 
 logger = logging.getLogger(__name__)
-
 _DISPATCH_CONCURRENCY = 20
+_OUTBOX_BATCH_SIZE = 500
 
 
 class _SendOutcome(StrEnum):
@@ -28,18 +44,17 @@ class _SendOutcome(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class _DispatchOutcome:
+class _SendResult:
+    delivery: PendingNotificationDelivery
+    outcome: _SendOutcome
+    error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchSummary:
     delivered: int = 0
     unreachable: int = 0
     transient_failed: int = 0
-
-    @property
-    def should_commit(self) -> bool:
-        if self.delivered > 0:
-            return True
-        if self.transient_failed > 0:
-            return False
-        return True
 
 
 def format_slots_available(
@@ -50,9 +65,7 @@ def format_slots_available(
     slots: tuple[str, ...],
 ) -> str:
     slot_lines = "\n".join(f"• {item}" for item in slots[:15]) or details
-    extra = ""
-    if len(slots) > 15:
-        extra = f"\n… ще {len(slots) - 15}"
+    extra = f"\n… ще {len(slots) - 15}" if len(slots) > 15 else ""
     return (
         f"З'явилися вільні слоти — {city_name}\n\n"
         f"{slot_lines}{extra}\n\n"
@@ -60,10 +73,35 @@ def format_slots_available(
     )
 
 
-def format_slots_gone(*, city_name: str) -> str:
+def format_human_action_required(
+    *,
+    city_name: str,
+    target_url: str,
+    failure_code: ScraperFailureCode,
+) -> str:
+    actions = {
+        ScraperFailureCode.CDP_UNAVAILABLE: (
+            "Запустіть dedicated CDP Chrome і перевірте CDP_URL."
+        ),
+        ScraperFailureCode.TARGET_TAB_MISSING: (
+            "Відкрийте сторінку запису в dedicated CDP Chrome."
+        ),
+        ScraperFailureCode.TARGET_TAB_CLOSED: (
+            "Повторно відкрийте сторінку запису в dedicated CDP Chrome."
+        ),
+        ScraperFailureCode.CLOUDFLARE_CHALLENGE: (
+            "Вручну пройдіть перевірку Cloudflare у відкритій вкладці."
+        ),
+    }
+    action = actions.get(
+        failure_code,
+        "Перевірте вкладку запису в dedicated CDP Chrome.",
+    )
     return (
-        f"Вільні слоти в {city_name} вже зайняті. "
-        "Бот знову повідомить, коли з'являться нові."
+        f"⚠️ Моніторинг потребує втручання — {city_name}\n\n"
+        f"Причина: {failure_code.value}\n"
+        f"{action}\n\n"
+        f"URL: {target_url}"
     )
 
 
@@ -80,174 +118,193 @@ class Notifier:
         self._database = database
         self._sender = sender
         self._city_name = city_name
+        self._city_key = city_name.strip().lower()
         self._target_url = target_url
-        self._admin_ids = tuple(admin_ids or ())
-        self._current_state: SlotStatus | None = None
-        self._last_notified_state: SlotStatus | None = None
-        self._pending_notify: SlotStatus | None = None
-        self._session_alert_sent = False
+        self._admin_ids = tuple(dict.fromkeys(admin_ids or ()))
+        self._drain_lock = asyncio.Lock()
 
-    def prime_previous(self, state: SlotStatus | None) -> None:
-        self._current_state = state
-        self._last_notified_state = state
-        self._pending_notify = None
-
-    async def handle_check(self, result: SlotCheckResult) -> SlotStatus | None:
+    async def handle_verified_result(self, result: SlotCheckResult) -> bool:
         if result.status is SlotStatus.UNKNOWN:
-            return self._last_notified_state
-
-        self._session_alert_sent = False
-        self._current_state = result.status
-        last_notified = (
-            self._last_notified_state
-            if self._last_notified_state is not None
-            else SlotStatus.NO_SLOTS
+            raise ValueError("verified result cannot be UNKNOWN")
+        text = format_slots_available(
+            city_name=self._city_name,
+            target_url=self._target_url,
+            details=result.details,
+            slots=result.slots,
         )
-        dropped_stale_pending = False
-        if self._pending_notify is not None and self._pending_notify is not result.status:
-            logger.info(
-                "pending_transition_dropped",
-                extra={
-                    "city": self._city_name,
-                    "dropped": self._pending_notify.value,
-                    "observed": result.status.value,
-                },
-            )
-            self._pending_notify = None
-            dropped_stale_pending = True
-
-        needs_alert = False
-        if self._pending_notify is result.status:
-            needs_alert = True
-        elif last_notified is not result.status:
-            needs_alert = True
-        elif dropped_stale_pending and result.status is SlotStatus.FREE_SLOTS_AVAILABLE:
-            needs_alert = True
-
-        if not needs_alert:
-            return self._last_notified_state
-
-        text, event_name = self._alert_payload(result)
-        subscribers = await get_all_active_subscribers(self._database.connection)
-        outcome = await self._dispatch(subscribers, text)
-        if not outcome.should_commit:
-            self._pending_notify = result.status
-            logger.warning(
-                "notify_deferred",
-                extra={
-                    "city": self._city_name,
-                    "delivered": outcome.delivered,
-                    "unreachable": outcome.unreachable,
-                    "transient_failed": outcome.transient_failed,
-                    "pending_status": result.status.value,
-                },
-            )
-            return self._last_notified_state
-
-        self._last_notified_state = result.status
-        self._pending_notify = None
+        admin_recipients = [
+            NotificationRecipient(chat_id=admin_id)
+            for admin_id in self._admin_ids
+        ]
+        previous, transitioned, event_id = await persist_verified_result(
+            self._database,
+            city_key=self._city_key,
+            slot_state=result.status,
+            verified_at=result.checked_at,
+            details=result.details,
+            notification_text=text,
+            recipients=admin_recipients,
+        )
         logger.info(
-            event_name,
-            extra={"city": self._city_name, "recipients": len(subscribers)},
+            "verified_slot_state_persisted",
+            extra={
+                "city": self._city_name,
+                "previous": previous.value,
+                "current": result.status.value,
+                "transitioned": transitioned,
+                "event_id": event_id,
+            },
         )
-        return self._last_notified_state
+        return transitioned
 
-    async def notify_session_expired(self) -> None:
-        if self._session_alert_sent:
-            return
-        logger.warning("session_expired_alert", extra={"city": self._city_name})
-        if not self._admin_ids:
-            logger.warning("session_expired_no_admins", extra={"city": self._city_name})
-            self._session_alert_sent = True
-            return
-        delivered = 0
-        for admin_id in self._admin_ids:
+    async def handle_human_action_required(
+        self,
+        error: HumanActionRequiredError,
+        *,
+        attempted_at: datetime,
+    ) -> bool:
+        text = format_human_action_required(
+            city_name=self._city_name,
+            target_url=self._target_url,
+            failure_code=error.failure_code,
+        )
+        recipients = [
+            NotificationRecipient(chat_id=admin_id)
+            for admin_id in self._admin_ids
+        ]
+        is_new, event_id = await persist_human_action_incident(
+            self._database,
+            city_key=self._city_key,
+            failure_code=error.failure_code,
+            attempted_at=attempted_at,
+            details=str(error),
+            notification_text=text,
+            recipients=recipients,
+        )
+        logger.warning(
+            "human_action_incident_recorded",
+            extra={
+                "city": self._city_name,
+                "failure_code": error.failure_code.value,
+                "new_incident": is_new,
+                "event_id": event_id,
+            },
+        )
+        return is_new
+
+    async def drain_outbox(self) -> DispatchSummary:
+        async with self._drain_lock:
             try:
-                await self._sender.send(admin_id, SESSION_EXPIRED_ALERT)
-                delivered += 1
-            except RecipientUnreachableError:
-                logger.warning(
-                    "session_expired_admin_unreachable",
-                    extra={"chat_id": admin_id},
+                deliveries = await list_pending_deliveries(
+                    self._database.connection,
+                    city_key=self._city_key,
+                    limit=_OUTBOX_BATCH_SIZE,
                 )
-            except (DeliveryError, OSError, TimeoutError) as exc:
-                logger.warning(
-                    "session_expired_alert_failed",
-                    extra={"chat_id": admin_id, "error": str(exc)},
-                )
-            except Exception as exc:
+            except aiosqlite.Error as exc:
                 logger.exception(
-                    "session_expired_alert_unexpected",
-                    extra={"chat_id": admin_id, "error": str(exc)},
+                    "outbox_read_failed",
+                    extra={"city": self._city_name, "error": str(exc)},
                 )
-        if delivered > 0:
-            self._session_alert_sent = True
+                return DispatchSummary(transient_failed=1)
+            if not deliveries:
+                return DispatchSummary()
 
-    def _alert_payload(self, result: SlotCheckResult) -> tuple[str, str]:
-        if result.status is SlotStatus.FREE_SLOTS_AVAILABLE:
-            return (
-                format_slots_available(
-                    city_name=self._city_name,
-                    target_url=self._target_url,
-                    details=result.details,
-                    slots=result.slots,
-                ),
-                "notified_slots_available",
-            )
-        return format_slots_gone(city_name=self._city_name), "notified_slots_gone"
+            semaphore = asyncio.Semaphore(_DISPATCH_CONCURRENCY)
 
-    async def _dispatch(self, subscribers: list[Subscriber], text: str) -> _DispatchOutcome:
-        semaphore = asyncio.Semaphore(_DISPATCH_CONCURRENCY)
+            async def _send(
+                delivery: PendingNotificationDelivery,
+            ) -> _SendResult:
+                async with semaphore:
+                    try:
+                        await self._sender.send(delivery.chat_id, delivery.text)
+                        return _SendResult(delivery, _SendOutcome.DELIVERED)
+                    except RecipientUnreachableError as exc:
+                        return _SendResult(
+                            delivery,
+                            _SendOutcome.UNREACHABLE,
+                            str(exc),
+                        )
+                    except (DeliveryError, OSError, TimeoutError) as exc:
+                        return _SendResult(
+                            delivery,
+                            _SendOutcome.TRANSIENT,
+                            str(exc),
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "notify_unexpected",
+                            extra={
+                                "city": self._city_name,
+                                "event_id": delivery.event_id,
+                                "chat_id": delivery.chat_id,
+                                "error": str(exc),
+                            },
+                        )
+                        return _SendResult(
+                            delivery,
+                            _SendOutcome.TRANSIENT,
+                            str(exc),
+                        )
 
-        async def _send_one(subscriber: Subscriber) -> _SendOutcome:
-            async with semaphore:
+            results = await asyncio.gather(*(_send(item) for item in deliveries))
+            delivered = 0
+            unreachable = 0
+            transient_failed = 0
+            for result in results:
                 try:
-                    await self._sender.send(subscriber.chat_id, text)
-                    return _SendOutcome.DELIVERED
-                except RecipientUnreachableError:
-                    logger.warning(
-                        "unsubscribed_unreachable",
-                        extra={"user_id": subscriber.user_id, "chat_id": subscriber.chat_id},
-                    )
-                    await remove_subscriber(self._database.connection, subscriber.user_id)
-                    return _SendOutcome.UNREACHABLE
-                except (DeliveryError, OSError, TimeoutError) as exc:
-                    logger.warning(
-                        "notify_failed",
-                        extra={
-                            "user_id": subscriber.user_id,
-                            "chat_id": subscriber.chat_id,
-                            "error": str(exc),
-                        },
-                    )
-                    return _SendOutcome.TRANSIENT
-                except Exception as exc:
+                    async with self._database.write_lock:
+                        if result.outcome is _SendOutcome.DELIVERED:
+                            await mark_delivery_delivered(
+                                self._database.connection,
+                                event_id=result.delivery.event_id,
+                                chat_id=result.delivery.chat_id,
+                                delivered_at=datetime.now(timezone.utc),
+                            )
+                            delivered += 1
+                        elif result.outcome is _SendOutcome.UNREACHABLE:
+                            await mark_delivery_unreachable(
+                                self._database.connection,
+                                event_id=result.delivery.event_id,
+                                chat_id=result.delivery.chat_id,
+                                error=result.error,
+                            )
+                            if result.delivery.user_id is not None:
+                                await remove_subscriber(
+                                    self._database.connection,
+                                    result.delivery.user_id,
+                                )
+                            unreachable += 1
+                        else:
+                            await mark_delivery_failed(
+                                self._database.connection,
+                                event_id=result.delivery.event_id,
+                                chat_id=result.delivery.chat_id,
+                                error=result.error,
+                            )
+                            transient_failed += 1
+                except aiosqlite.Error as exc:
+                    transient_failed += 1
                     logger.exception(
-                        "notify_unexpected",
+                        "outbox_update_failed",
                         extra={
-                            "user_id": subscriber.user_id,
-                            "chat_id": subscriber.chat_id,
+                            "city": self._city_name,
+                            "event_id": result.delivery.event_id,
+                            "chat_id": result.delivery.chat_id,
                             "error": str(exc),
                         },
                     )
-                    return _SendOutcome.TRANSIENT
-
-        raw_results = await asyncio.gather(
-            *(_send_one(item) for item in subscribers),
-            return_exceptions=True,
-        )
-        delivered = 0
-        unreachable = 0
-        transient_failed = 0
-        for item in raw_results:
-            if item is _SendOutcome.DELIVERED:
-                delivered += 1
-            elif item is _SendOutcome.UNREACHABLE:
-                unreachable += 1
-            else:
-                transient_failed += 1
-        return _DispatchOutcome(
-            delivered=delivered,
-            unreachable=unreachable,
-            transient_failed=transient_failed,
-        )
+            summary = DispatchSummary(
+                delivered=delivered,
+                unreachable=unreachable,
+                transient_failed=transient_failed,
+            )
+            logger.info(
+                "outbox_drained",
+                extra={
+                    "city": self._city_name,
+                    "delivered": summary.delivered,
+                    "unreachable": summary.unreachable,
+                    "transient_failed": summary.transient_failed,
+                },
+            )
+            return summary

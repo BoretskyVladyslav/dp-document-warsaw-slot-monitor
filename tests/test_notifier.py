@@ -2,287 +2,230 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.core.exceptions import DeliveryError, RecipientUnreachableError
+from src.core.exceptions import (
+    CdpUnavailableError,
+    CloudflareChallengeError,
+    DeliveryError,
+    RecipientUnreachableError,
+)
 from src.core.models import SlotCheckResult, SlotStatus
 from src.database.connection import Database
+from src.database.monitor_state import get_monitor_state
+from src.database.notification_outbox import list_pending_deliveries
 from src.database.schema import init_schema
-from src.database.subscribers import add_subscriber
+from src.database.subscribers import add_subscriber, get_subscriber
 from src.services.notifier import Notifier
 
+TARGET_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
 
-class _FakeSender:
+
+class RecordingSender:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
+        self.failures: dict[int, BaseException] = {}
 
     async def send(self, chat_id: int, text: str) -> None:
-        self.sent.append((chat_id, text))
-
-
-class _FailingSender:
-    async def send(self, chat_id: int, text: str) -> None:
-        raise RecipientUnreachableError(chat_id)
-
-
-class _SequenceSender:
-    def __init__(self, fail_on_calls: frozenset[int]) -> None:
-        self._fail_on_calls = fail_on_calls
-        self.calls = 0
-        self.sent: list[str] = []
-
-    async def send(self, chat_id: int, text: str) -> None:
-        self.calls += 1
-        if self.calls in self._fail_on_calls:
-            raise DeliveryError(chat_id, reason="telegram network error")
-        self.sent.append(text)
-
-
-class _PerChatSender:
-    def __init__(self, failures: dict[int, BaseException]) -> None:
-        self._failures = failures
-        self.sent: list[int] = []
-
-    async def send(self, chat_id: int, text: str) -> None:
-        failure = self._failures.get(chat_id)
+        failure = self.failures.get(chat_id)
         if failure is not None:
             raise failure
-        self.sent.append(chat_id)
+        self.sent.append((chat_id, text))
 
 
 class NotifierTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        db_path = str(Path(self._tmp.name) / "test.db")
-        self.db = Database(db_path)
+        self.db = Database(str(Path(self._tmp.name) / "notifier.db"))
         await self.db.connect()
         await init_schema(self.db.connection)
         await add_subscriber(
-            self.db.connection, user_id=1, chat_id=100, username="alice"
+            self.db.connection,
+            user_id=1,
+            chat_id=100,
+            username="alice",
         )
+        self.sender = RecordingSender()
+        self.notifier = self._notifier(admin_ids=[42])
+        self.checked_at = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
 
     async def asyncTearDown(self) -> None:
         await self.db.close()
         self._tmp.cleanup()
 
-    async def test_notifies_on_no_slots_to_free(self) -> None:
-        sender = _FakeSender()
-        notifier = Notifier(
+    def _notifier(self, *, admin_ids: list[int] | None = None) -> Notifier:
+        return Notifier(
             database=self.db,
-            sender=sender,
+            sender=self.sender,
             city_name="Warsaw",
-            target_url="https://example.test/queue",
+            target_url=TARGET_URL,
+            admin_ids=admin_ids,
         )
-        result = SlotCheckResult(
-            status=SlotStatus.FREE_SLOTS_AVAILABLE,
-            checked_at=datetime.now(timezone.utc),
-            details="2099-09-10 10:00",
-            slots=("2099-09-10 10:00",),
-        )
-        await notifier.handle_check(result)
-        self.assertEqual(len(sender.sent), 1)
-        self.assertIn("https://example.test/queue", sender.sent[0][1])
 
-        await notifier.handle_check(result)
-        self.assertEqual(len(sender.sent), 1)
-
-    async def test_notifies_once_when_slots_gone(self) -> None:
-        sender = _FakeSender()
-        notifier = Notifier(
-            database=self.db,
-            sender=sender,
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
-        )
-        notifier.prime_previous(SlotStatus.FREE_SLOTS_AVAILABLE)
-        gone = SlotCheckResult(
-            status=SlotStatus.NO_SLOTS,
-            checked_at=datetime.now(timezone.utc),
-        )
-        await notifier.handle_check(gone)
-        await notifier.handle_check(gone)
-        self.assertEqual(len(sender.sent), 1)
-        self.assertIn("зайняті", sender.sent[0][1])
-
-    async def test_unknown_does_not_notify(self) -> None:
-        sender = _FakeSender()
-        notifier = Notifier(
-            database=self.db,
-            sender=sender,
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
-        )
-        await notifier.handle_check(
-            SlotCheckResult(
-                status=SlotStatus.UNKNOWN,
-                checked_at=datetime.now(timezone.utc),
-                error="timeout",
-            )
-        )
-        self.assertEqual(sender.sent, [])
-
-    async def test_unreachable_recipient_is_deactivated(self) -> None:
-        notifier = Notifier(
-            database=self.db,
-            sender=_FailingSender(),
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
-        )
-        await notifier.handle_check(
-            SlotCheckResult(
-                status=SlotStatus.FREE_SLOTS_AVAILABLE,
-                checked_at=datetime.now(timezone.utc),
-                slots=("2099-09-10",),
-            )
-        )
-        from src.database.subscribers import get_subscriber
-
-        row = await get_subscriber(self.db.connection, 1)
-        assert row is not None
-        self.assertFalse(row.is_active)
-
-    async def test_transient_delivery_error_does_not_abort_or_deactivate(self) -> None:
-        await add_subscriber(self.db.connection, user_id=2, chat_id=200, username="bob")
-        sender = _PerChatSender(
-            {
-                100: DeliveryError(100, reason="telegram network error"),
-            }
-        )
-        notifier = Notifier(
-            database=self.db,
-            sender=sender,
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
-        )
-        result = await notifier.handle_check(
-            SlotCheckResult(
-                status=SlotStatus.FREE_SLOTS_AVAILABLE,
-                checked_at=datetime.now(timezone.utc),
-                slots=("2099-09-10",),
-            )
-        )
-        self.assertEqual(result, SlotStatus.FREE_SLOTS_AVAILABLE)
-        self.assertEqual(sender.sent, [200])
-        from src.database.subscribers import get_subscriber
-
-        alice = await get_subscriber(self.db.connection, 1)
-        bob = await get_subscriber(self.db.connection, 2)
-        assert alice is not None and bob is not None
-        self.assertTrue(alice.is_active)
-        self.assertTrue(bob.is_active)
-
-    async def test_unexpected_send_error_does_not_abort_handle_check(self) -> None:
-        await add_subscriber(self.db.connection, user_id=2, chat_id=200, username="bob")
-        sender = _PerChatSender({100: RuntimeError("boom")})
-        notifier = Notifier(
-            database=self.db,
-            sender=sender,
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
-        )
-        result = await notifier.handle_check(
-            SlotCheckResult(
-                status=SlotStatus.FREE_SLOTS_AVAILABLE,
-                checked_at=datetime.now(timezone.utc),
-                slots=("2099-09-10",),
-            )
-        )
-        self.assertEqual(result, SlotStatus.FREE_SLOTS_AVAILABLE)
-        self.assertEqual(sender.sent, [200])
-
-
-    def _free_result(self, slot: str = "2099-09-10") -> SlotCheckResult:
+    def _result(
+        self,
+        status: SlotStatus,
+        *,
+        checked_at: datetime | None = None,
+    ) -> SlotCheckResult:
         return SlotCheckResult(
-            status=SlotStatus.FREE_SLOTS_AVAILABLE,
-            checked_at=datetime.now(timezone.utc),
-            details=slot,
-            slots=(slot,),
+            status=status,
+            checked_at=checked_at or self.checked_at,
+            details="visible booking form" if status is SlotStatus.FREE_SLOTS_AVAILABLE else "",
         )
 
-    def _gone_result(self) -> SlotCheckResult:
-        return SlotCheckResult(
-            status=SlotStatus.NO_SLOTS,
-            checked_at=datetime.now(timezone.utc),
+    async def test_free_transition_is_queued_once_for_subscribers_and_admin(self) -> None:
+        transitioned = await self.notifier.handle_verified_result(
+            self._result(SlotStatus.FREE_SLOTS_AVAILABLE)
+        )
+        self.assertTrue(transitioned)
+        self.assertEqual(self.sender.sent, [])
+
+        summary = await self.notifier.drain_outbox()
+        self.assertEqual(summary.delivered, 2)
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42, 100])
+
+        repeated = await self.notifier.handle_verified_result(
+            self._result(
+                SlotStatus.FREE_SLOTS_AVAILABLE,
+                checked_at=self.checked_at + timedelta(minutes=3),
+            )
+        )
+        self.assertFalse(repeated)
+        await self.notifier.drain_outbox()
+        self.assertEqual(len(self.sender.sent), 2)
+
+    async def test_admin_is_not_duplicated_when_also_subscribed(self) -> None:
+        await add_subscriber(
+            self.db.connection,
+            user_id=42,
+            chat_id=42,
+            username="admin",
+        )
+        await self.notifier.handle_verified_result(
+            self._result(SlotStatus.FREE_SLOTS_AVAILABLE)
         )
 
-    async def test_all_transient_failures_keep_state_for_retry(self) -> None:
-        sender = _PerChatSender({100: DeliveryError(100, reason="telegram network error")})
-        notifier = Notifier(
-            database=self.db,
-            sender=sender,
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
+        await self.notifier.drain_outbox()
+
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent].count(42), 1)
+
+    async def test_transient_failure_retries_only_pending_recipient(self) -> None:
+        await add_subscriber(
+            self.db.connection,
+            user_id=2,
+            chat_id=200,
+            username="bob",
         )
-        first = await notifier.handle_check(self._free_result())
-        self.assertIsNone(first)
-        self.assertEqual(sender.sent, [])
-
-        sender._failures.clear()
-        second = await notifier.handle_check(self._free_result())
-        self.assertEqual(second, SlotStatus.FREE_SLOTS_AVAILABLE)
-        self.assertEqual(sender.sent, [100])
-
-        third = await notifier.handle_check(self._free_result())
-        self.assertEqual(third, SlotStatus.FREE_SLOTS_AVAILABLE)
-        self.assertEqual(sender.sent, [100])
-
-    async def test_session_expired_alerts_admins_once(self) -> None:
-        sender = _FakeSender()
-        notifier = Notifier(
-            database=self.db,
-            sender=sender,
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
-            admin_ids=[42],
+        self.sender.failures[100] = DeliveryError(100, "network")
+        await self.notifier.handle_verified_result(
+            self._result(SlotStatus.FREE_SLOTS_AVAILABLE)
         )
-        from src.services.notifier import SESSION_EXPIRED_ALERT
 
-        await notifier.notify_session_expired()
-        await notifier.notify_session_expired()
-        self.assertEqual(sender.sent, [(42, SESSION_EXPIRED_ALERT)])
+        first = await self.notifier.drain_outbox()
 
-        await notifier.handle_check(self._free_result())
-        await notifier.notify_session_expired()
-        self.assertEqual(sender.sent[-1], (42, SESSION_EXPIRED_ALERT))
-        self.assertEqual(sum(1 for _chat, text in sender.sent if text == SESSION_EXPIRED_ALERT), 2)
-
-    async def test_unreachable_commits_state_without_retry(self) -> None:
-        sender = _FailingSender()
-        notifier = Notifier(
-            database=self.db,
-            sender=sender,
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
+        self.assertEqual(first.delivered, 2)
+        self.assertEqual(first.transient_failed, 1)
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42, 200])
+        pending = await list_pending_deliveries(
+            self.db.connection,
+            city_key="warsaw",
         )
-        first = await notifier.handle_check(self._free_result())
-        self.assertEqual(first, SlotStatus.FREE_SLOTS_AVAILABLE)
-        second = await notifier.handle_check(self._free_result())
-        self.assertEqual(second, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual([item.chat_id for item in pending], [100])
+        self.assertEqual(pending[0].attempts, 1)
 
-    async def test_oscillation_drops_stale_gone_and_sends_fresh_free(self) -> None:
-        sender = _SequenceSender(fail_on_calls=frozenset({2}))
-        notifier = Notifier(
-            database=self.db,
-            sender=sender,
-            city_name="Warsaw",
-            target_url="https://example.test/queue",
+        self.sender.failures.clear()
+        restarted_notifier = self._notifier(admin_ids=[42])
+        second = await restarted_notifier.drain_outbox()
+
+        self.assertEqual(second.delivered, 1)
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42, 200, 100])
+        self.assertEqual(
+            await list_pending_deliveries(
+                self.db.connection,
+                city_key="warsaw",
+            ),
+            [],
         )
-        first = await notifier.handle_check(self._free_result("2099-09-10"))
-        self.assertEqual(first, SlotStatus.FREE_SLOTS_AVAILABLE)
-        self.assertEqual(len(sender.sent), 1)
-        self.assertIn("2099-09-10", sender.sent[0])
 
-        deferred = await notifier.handle_check(self._gone_result())
-        self.assertEqual(deferred, SlotStatus.FREE_SLOTS_AVAILABLE)
-        self.assertEqual(len(sender.sent), 1)
-        self.assertTrue(all("зайняті" not in text for text in sender.sent))
+    async def test_unreachable_subscriber_is_deactivated(self) -> None:
+        self.sender.failures[100] = RecipientUnreachableError(100)
+        await self.notifier.handle_verified_result(
+            self._result(SlotStatus.FREE_SLOTS_AVAILABLE)
+        )
 
-        reconciled = await notifier.handle_check(self._free_result("2099-09-11"))
-        self.assertEqual(reconciled, SlotStatus.FREE_SLOTS_AVAILABLE)
-        self.assertEqual(len(sender.sent), 2)
-        self.assertIn("2099-09-11", sender.sent[1])
-        self.assertTrue(all("зайняті" not in text for text in sender.sent))
+        summary = await self.notifier.drain_outbox()
+
+        self.assertEqual(summary.unreachable, 1)
+        subscriber = await get_subscriber(self.db.connection, 1)
+        assert subscriber is not None
+        self.assertFalse(subscriber.is_active)
+
+    async def test_incident_alert_is_admin_only_and_deduplicated_across_restart(
+        self,
+    ) -> None:
+        failure = CloudflareChallengeError("challenge visible")
+        first = await self.notifier.handle_human_action_required(
+            failure,
+            attempted_at=self.checked_at,
+        )
+        repeated = await self.notifier.handle_human_action_required(
+            failure,
+            attempted_at=self.checked_at + timedelta(minutes=3),
+        )
+        self.assertTrue(first)
+        self.assertFalse(repeated)
+
+        restarted_notifier = self._notifier(admin_ids=[42])
+        repeated_after_restart = (
+            await restarted_notifier.handle_human_action_required(
+                failure,
+                attempted_at=self.checked_at + timedelta(minutes=6),
+            )
+        )
+        self.assertFalse(repeated_after_restart)
+        await restarted_notifier.drain_outbox()
+
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42])
+        self.assertIn("cloudflare_challenge", self.sender.sent[0][1])
+
+    async def test_successful_verification_clears_incident_for_future_alert(self) -> None:
+        failure = CdpUnavailableError("CDP offline")
+        await self.notifier.handle_human_action_required(
+            failure,
+            attempted_at=self.checked_at,
+        )
+        await self.notifier.drain_outbox()
+        await self.notifier.handle_verified_result(
+            self._result(
+                SlotStatus.NO_SLOTS,
+                checked_at=self.checked_at + timedelta(minutes=3),
+            )
+        )
+        state = await get_monitor_state(self.db.connection, "warsaw")
+        assert state is not None
+        self.assertIsNone(state.human_action_incident_key)
+
+        is_new = await self.notifier.handle_human_action_required(
+            failure,
+            attempted_at=self.checked_at + timedelta(minutes=6),
+        )
+        await self.notifier.drain_outbox()
+
+        self.assertTrue(is_new)
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42, 42])
+
+    async def test_no_slots_transition_does_not_broadcast(self) -> None:
+        transitioned = await self.notifier.handle_verified_result(
+            self._result(SlotStatus.NO_SLOTS)
+        )
+
+        summary = await self.notifier.drain_outbox()
+
+        self.assertTrue(transitioned)
+        self.assertEqual(summary.delivered, 0)
+        self.assertEqual(self.sender.sent, [])
 
 
 if __name__ == "__main__":

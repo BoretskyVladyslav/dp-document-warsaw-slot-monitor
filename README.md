@@ -1,104 +1,142 @@
 # DP Document Warsaw Slot Monitor
 
-Telegram bot that watches the DP «Документ» electronic queue and notifies subscribers when appointment slots appear or disappear. Default target is Warsaw; another city is a config change (`TARGET_URL`, `CITY_NAME`), not a code change.
+Telegram bot that monitors the DP «Документ» electronic queue and notifies active subscribers when booking becomes available. Warsaw is the initial target; city identity and URL remain configuration values.
 
-## Prerequisites
+## Runtime model
 
-- Python 3.11+
-- Docker and Docker Compose v2 (for container deploy)
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Your Telegram numeric user ID for `/status` (for example via [@userinfobot](https://t.me/userinfobot))
+The monitor operates only through CDP attachment to a dedicated, visible Google Chrome profile on Windows.
+
+- Chrome is started by `scripts\start_chrome_cdp.bat`.
+- The script opens `TARGET_URL` in a dedicated persistent profile.
+- A user completes any Cloudflare challenge in that tab.
+- The bot attaches to `CDP_URL`, finds that exact tab, soft-reloads it, and reads visible DOM evidence.
+- The bot never launches a browser, creates a tab, imports `cf_clearance`, or falls back to headless Chromium.
+
+Cloudflare access cannot be guaranteed. The reliability contract is fail-closed classification, durable notifications, controlled recovery, and no automated challenge loop.
+
+## Requirements
+
+- Windows 10 or later
+- Python 3.14+
+- Google Chrome
+- Telegram bot token
+- Telegram private-chat ID for each administrator
 
 ## Configuration
 
-```bash
-copy .env.example .env
+Copy the example and edit the resulting `.env`:
+
+```powershell
+Copy-Item .env.example .env
 ```
 
-On Linux/macOS use `cp .env.example .env`. Edit `.env` before the first run.
+Required settings:
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `BOT_TOKEN` | yes | — | Bot token from BotFather |
-| `ADMIN_IDS` | yes for `/status` | empty | Comma-separated Telegram user IDs |
-| `TARGET_URL` | yes | Warsaw e-queue URL | Page Playwright opens each cycle |
-| `CHECK_INTERVAL_SECONDS` | no | `600` | Pause between checks (15–3600) |
-| `PROXY_URL` | no | unset | Playwright proxy, e.g. `http://127.0.0.1:8080` |
-| `CITY_NAME` | no | `Warsaw` | Label used in alerts and `/status` |
-| `HEADLESS` | no | `true` | `false` only for local debugging |
-| `STORAGE_STATE_PATH` | no | `data/storage_state.json` | Cookies from `scripts/solve_session.py` |
-| `CDP_URL` | no | unset | Playwright `connect_over_cdp` endpoint, e.g. `http://127.0.0.1:9222` |
-| `CHECK_ONCE` | no | `false` | `true` runs one check and exits |
-| `DATABASE_PATH` | no | `data/monitor.db` | SQLite file; Compose sets `/app/data/monitor.db` |
-| `SERVICE_OPTION` | no | unset | Dropdown option text to click after load |
-| `PLAYWRIGHT_TIMEOUT_MS` | no | `60000` | Navigation timeout |
+- `BOT_TOKEN`: BotFather token.
+- `ADMIN_IDS`: comma-separated private-chat IDs for diagnostics, `/check_now`, and system incidents.
+- `TARGET_URL`: exact queue page.
+- `CDP_URL`: normally `http://127.0.0.1:9222`.
 
-Never commit `.env`. `.env.example` has no secrets.
+Optional settings:
 
-## Run locally (Python)
+- `CITY_NAME`: city label; default `Warsaw`.
+- `CHECK_INTERVAL_SECONDS`: scheduled interval from 15 to 3600 seconds; default `600`.
+- `DATABASE_PATH`: SQLite path; default `data/monitor.db`.
+- `CHECK_ONCE`: perform one cycle and exit; default `false`.
 
-From the repository root:
+Never commit `.env`.
 
-```bash
+## Installation
+
+```powershell
 python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-playwright install chromium
-python scripts/solve_session.py
-python -m src.main
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-Linux/macOS activate with `source .venv/bin/activate`. SQLite is created at `data/monitor.db` (gitignored). Logs go to stdout.
+## Start
 
-To attach to a real Chrome session (same TLS/IP/cookies as your desktop):
+Start the dedicated Chrome profile. The optional first argument overrides the default Warsaw URL; the optional second argument overrides port `9222`:
 
-1. Close all Chrome windows.
-2. Run `scripts\start_chrome_cdp.bat` (or `scripts\start_chrome_debug.bat` with an optional custom profile dir).
-3. Set `CDP_URL=http://127.0.0.1:9222` in `.env`.
-4. Open `TARGET_URL` in that Chrome window (or leave it; the worker will reuse a matching tab or same-host tab, otherwise open a new tab).
-5. Start the bot. The worker does not close Chrome or your existing tabs.
-
-If `CDP_URL` is empty or the connect fails, the worker launches Chrome/Chromium with `storage_state` as before.
-
-## Run with Docker Compose
-
-```bash
-docker compose up --build -d
+```powershell
+scripts\start_chrome_cdp.bat
 ```
 
-Compose bind-mounts `./data` to `/app/data` so subscribers survive container restarts. Chromium runs headless. Policy is `restart: unless-stopped`. A process healthcheck starts after 60s.
+The script:
 
-```bash
-docker compose logs -f bot
-docker compose ps
-docker compose down
+1. starts Chrome with `--remote-debugging-address=127.0.0.1`;
+2. enables `--remote-debugging-port=9222`;
+3. uses `%LOCALAPPDATA%\Google\Chrome\User Data\CDP_Profile`;
+4. opens the target queue URL;
+5. verifies that the CDP endpoint exposes a tab on the configured target host.
+
+If another process already owns port `9222`, the script fails instead of attaching the bot to the wrong browser. Stop that process or choose another port and set the same value in `.env`:
+
+```powershell
+scripts\start_chrome_cdp.bat "https://warszawa.pasport.org.ua/solutions/e-queue" 9223
 ```
 
-## Subscribers and logs
-
-| Action | How |
-|---|---|
-| Subscribe | User sends `/start` to the bot |
-| Unsubscribe | User sends `/stop` |
-| Help | `/help` |
-| Monitor snapshot | `/status` (IDs in `ADMIN_IDS` only) |
-
-Inspect the database on the host (bind mount) or after a local Python run:
-
-```bash
-sqlite3 data/monitor.db "SELECT user_id, chat_id, username, is_active FROM subscribers;"
+```dotenv
+CDP_URL=http://127.0.0.1:9223
 ```
 
-Docker logs:
+Complete any Cloudflare challenge in the opened target tab, then run:
 
-```bash
-docker compose logs -f bot
+```powershell
+.venv\Scripts\python.exe -m src.main
 ```
 
-Local Python logs are structured lines on stdout (`slot_check`, `notify_deferred`, `notified_slots_available`, …).
+Do not close the dedicated Chrome process or target tab while monitoring.
+
+## Detection
+
+Only visible DOM evidence is authoritative:
+
+- `NO_SLOTS`: the complete Ukrainian occupied banner is visible.
+- `FREE_SLOTS_AVAILABLE`: the visible service select contains `- Обрати -` and a visible `input[type="tel"]` exists.
+- `UNKNOWN`: evidence is partial, contradictory, challenged, disconnected, timed out, or otherwise inconclusive.
+
+The final visible state must remain stable before it is accepted. `UNKNOWN` never creates a slot alert and never overwrites the last verified business state.
+
+## Recovery
+
+Missing tabs, closed tabs, CDP disconnects, and Cloudflare challenges create a persistent human-action incident.
+
+- Administrators receive one system alert per unresolved incident.
+- Repeated checks do not reload a challenged page.
+- Open or refresh the exact target tab and complete the challenge manually.
+- A successful visible-state verification clears the incident and resumes normal soft reloads.
+
+## Telegram commands
+
+Public:
+
+- `/start` or `/subscribe`: enable alerts.
+- `/stop` or `/unsubscribe`: disable alerts.
+- `/help`: command summary.
+- `/status`: city, last verified slot state/time, and booking URL.
+
+Administrator private chats:
+
+- `/status`: public fields plus uptime, latest attempt/error, CDP connection, target-tab presence, and scraper health.
+- `/check_now`: await the current check or start one immediately. It never runs concurrently with a scheduled browser interaction.
+
+## Persistence and delivery
+
+SQLite stores:
+
+- subscriptions;
+- last attempted and last verified checks;
+- active human-action incidents;
+- transition events and per-recipient outbox delivery state.
+
+Only transitions into `FREE_SLOTS_AVAILABLE` create business alerts. Successful recipients are not resent; transient failures remain pending for a later cycle; unreachable subscribers are deactivated.
+
+Delivery is durable at-least-once. Telegram does not provide a transactional idempotency key, so a process crash after Telegram accepts a message but before SQLite records success can still produce one duplicate.
 
 ## Tests
 
-```bash
-python -m unittest discover -s tests -v
+```powershell
+python -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest -q
 ```

@@ -34,11 +34,67 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
             signal.signal(sig, lambda *_args: _request_stop())
 
 
+async def _request_polling_stop(
+    dispatcher: Dispatcher,
+    polling_task: asyncio.Task[None],
+) -> None:
+    if polling_task.done():
+        return
+    try:
+        await asyncio.wait_for(dispatcher.stop_polling(), timeout=5)
+    except RuntimeError as exc:
+        logger.warning("polling_stop_skipped", extra={"error": str(exc)})
+    except TimeoutError:
+        logger.warning("polling_stop_timeout")
+
+
+async def _supervise_runtime(
+    *,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    monitor: SlotMonitor,
+    stop: asyncio.Event,
+) -> None:
+    polling_task = asyncio.create_task(
+        dispatcher.start_polling(bot),
+        name="telegram-polling",
+    )
+    monitor_task = asyncio.create_task(
+        monitor.run(stop),
+        name="slot-monitor",
+    )
+    stop_task = asyncio.create_task(stop.wait(), name="shutdown-signal")
+    tasks = (polling_task, monitor_task, stop_task)
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        stop.set()
+        await _request_polling_stop(dispatcher, polling_task)
+        await monitor.shutdown()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                continue
+            if isinstance(result, BaseException):
+                raise result
+    finally:
+        stop.set()
+        await monitor.shutdown()
+        await _request_polling_stop(dispatcher, polling_task)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _amain(settings: Settings) -> None:
     database = Database(settings.database_path)
     await database.connect()
     scraper: SlotScraper | None = None
     bot: Bot | None = None
+    monitor: SlotMonitor | None = None
     try:
         await init_schema(database.connection)
         started_at = datetime.now(timezone.utc)
@@ -71,17 +127,15 @@ async def _amain(settings: Settings) -> None:
 
         stop = asyncio.Event()
         _install_signal_handlers(stop)
-
-        async def _watch_stop() -> None:
-            await stop.wait()
-            logger.info("shutdown_requested")
-            await dp.stop_polling()
-
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(dp.start_polling(bot))
-            tg.create_task(monitor.run(stop))
-            tg.create_task(_watch_stop())
+        await _supervise_runtime(
+            dispatcher=dp,
+            bot=bot,
+            monitor=monitor,
+            stop=stop,
+        )
     finally:
+        if monitor is not None:
+            await monitor.shutdown()
         if scraper is not None:
             await scraper.stop()
         if bot is not None:
@@ -98,7 +152,6 @@ async def main() -> None:
         extra={
             "city": settings.city_name,
             "interval": settings.check_interval_seconds,
-            "headless": settings.headless,
             "cdp_url": settings.cdp_url,
             "check_once": settings.check_once,
         },

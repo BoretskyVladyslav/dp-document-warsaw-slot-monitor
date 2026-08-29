@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from src.core.models import MonitorSnapshot, SlotStatus
+from src.core.models import MonitorSnapshot, SlotCheckResult, SlotStatus
 
 
 def format_start_confirmation(city_name: str) -> str:
@@ -22,31 +22,71 @@ def format_help(city_name: str) -> str:
         f"Бот стежить за електронною чергою ДП «Документ» ({city_name}) "
         "і пише лише коли стан слотів змінюється.\n\n"
         "/start — підписатися на сповіщення\n"
+        "/subscribe — підписатися на сповіщення\n"
         "/stop — відписатися\n"
+        "/unsubscribe — відписатися\n"
         "/help — ця довідка\n"
-        "/status — стан моніторингу (лише для адміністратора)"
+        "/status — стан моніторингу"
     )
 
 
-def format_status(snapshot: MonitorSnapshot) -> str:
-    last_check = (
-        snapshot.last_check_at.isoformat(sep=" ", timespec="seconds")
-        if snapshot.last_check_at
+def format_status(snapshot: MonitorSnapshot, *, is_admin: bool) -> str:
+    last_verified = (
+        snapshot.last_verified_at.isoformat(sep=" ", timespec="seconds")
+        if snapshot.last_verified_at
         else "ще не було"
     )
     state = _status_label(snapshot.slot_state)
-    uptime = str(timedelta(seconds=int(snapshot.uptime_seconds)))
-    error_line = f"\nОстання помилка: {snapshot.last_error}" if snapshot.last_error else ""
-    details = snapshot.last_details or "—"
-    return (
+    public_text = (
         f"Місто: {snapshot.city_name}\n"
-        f"Остання перевірка: {last_check}\n"
         f"Стан слотів: {state}\n"
+        f"Остання підтверджена перевірка: {last_verified}\n"
+        f"Запис: {snapshot.target_url}"
+    )
+    if not is_admin:
+        return public_text
+
+    health = snapshot.scraper_health
+    last_attempt = (
+        snapshot.last_attempt_at.isoformat(sep=" ", timespec="seconds")
+        if snapshot.last_attempt_at
+        else "ще не було"
+    )
+    health_status = health.status.value if health is not None else "UNKNOWN"
+    cdp_connected = "так" if health is not None and health.cdp_connected else "ні"
+    target_tab = "так" if health is not None and health.target_tab_present else "ні"
+    health_reason = (
+        health.failure_code.value
+        if health is not None and health.failure_code is not None
+        else "—"
+    )
+    last_error = snapshot.last_error or "—"
+    details = snapshot.last_details or "—"
+    uptime = str(timedelta(seconds=int(snapshot.uptime_seconds)))
+    return (
+        f"{public_text}\n\n"
+        f"Остання спроба: {last_attempt}\n"
+        f"Стан scraper: {health_status}\n"
+        f"CDP підключено: {cdp_connected}\n"
+        f"Цільова вкладка: {target_tab}\n"
+        f"Причина деградації: {health_reason}\n"
+        f"Остання помилка: {last_error}\n"
         f"Деталі: {details}\n"
         f"Активних підписників: {snapshot.active_subscribers}\n"
-        f"Аптайм: {uptime}\n"
-        f"URL: {snapshot.target_url}"
-        f"{error_line}"
+        f"Аптайм: {uptime}"
+    )
+
+
+def format_check_result(result: SlotCheckResult) -> str:
+    checked_at = result.checked_at.isoformat(sep=" ", timespec="seconds")
+    details = result.details or "—"
+    error = f"\nПомилка: {result.error}" if result.error else ""
+    return (
+        "Ручну перевірку завершено.\n"
+        f"Стан: {_status_label(result.status)}\n"
+        f"Час: {checked_at}\n"
+        f"Деталі: {details}"
+        f"{error}"
     )
 
 

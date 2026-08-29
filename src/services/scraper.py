@@ -2,40 +2,105 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
-import sys
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
-from playwright.async_api import Browser, BrowserContext, Page, Playwright
+from playwright.async_api import Browser, Page, Playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from src.core.config import Settings
-from src.core.exceptions import NetworkTimeoutError, ScraperError, SessionExpiredException
-from src.core.models import SlotCheckResult, SlotStatus
-from src.services.slot_parser import dumps_payload, is_cloudflare_challenge, parse_slot_page
-from src.services.stealth import CHROME_CLIENT_HINTS, STEALTH_INIT_SCRIPT, stealth_async
-from src.services.storage_state import is_usable_storage_state
+from src.core.exceptions import (
+    CdpUnavailableError,
+    CloudflareChallengeError,
+    HumanActionRequiredError,
+    TargetTabClosedError,
+    TargetTabMissingError,
+)
+from src.core.models import (
+    ScraperFailureCode,
+    ScraperHealthSnapshot,
+    ScraperHealthStatus,
+    SlotCheckResult,
+    SlotStatus,
+)
+from src.services.slot_parser import (
+    OCCUPIED_HEADING,
+    OCCUPIED_INSTRUCTION,
+    SELECT_PLACEHOLDER,
+    SERVICE_LABEL,
+    SlotPageEvidence,
+    classify_slot_evidence,
+    has_cloudflare_challenge,
+)
 
 logger = logging.getLogger(__name__)
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_MAX_ATTEMPTS = 2
-_CONTAINER_HEADLESS_ARGS: list[str] = [
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
-]
-_LANG_ARG = "--lang=uk-UA,uk"
+_CDP_CONNECT_TIMEOUT_MS = 15_000
+_CDP_RELOAD_TIMEOUT_MS = 15_000
+_DOM_SIGNAL_TIMEOUT_MS = 15_000
+_DOM_POLL_SECONDS = 0.25
+_DOM_STABILITY_SECONDS = 1.0
 
+_DOM_EVIDENCE_SCRIPT = f"""
+() => {{
+  const normalize = (value) => String(value || "")
+    .toLocaleLowerCase("uk-UA")
+    .replace(/[–—−]/g, "-")
+    .replace(/\\s+/g, " ")
+    .trim();
+  const isVisible = (element) => {{
+    if (!(element instanceof Element)) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none"
+      && style.visibility !== "hidden"
+      && style.opacity !== "0"
+      && rect.width > 0
+      && rect.height > 0;
+  }};
 
-def chrome_launch_args(*, headless: bool) -> list[str]:
-    if sys.platform == "win32" or not headless:
-        return [_LANG_ARG]
-    return [*_CONTAINER_HEADLESS_ARGS, _LANG_ARG]
+  const bodyText = document.body ? document.body.innerText : "";
+  const normalizedBody = normalize(bodyText);
+  const occupiedContainers = Array.from(
+    document.querySelectorAll("main, section, article, div")
+  );
+  const occupiedBannerVisible = occupiedContainers.some((element) => {{
+    if (!isVisible(element)) return false;
+    const text = normalize(element.innerText);
+    return text.includes({OCCUPIED_HEADING!r})
+      && text.includes({OCCUPIED_INSTRUCTION!r});
+  }});
+
+  const visibleSelects = Array.from(document.querySelectorAll("select"))
+    .filter(isVisible);
+  const serviceSelectVisible = normalizedBody.includes({SERVICE_LABEL!r})
+    && visibleSelects.length > 0;
+  const selectPlaceholderVisible = visibleSelects.some((select) =>
+    Array.from(select.options).some(
+      (option) => normalize(option.textContent).includes({SELECT_PLACEHOLDER!r})
+    )
+  );
+  const telInputVisible = Array.from(
+    document.querySelectorAll('input[type="tel"]')
+  ).some(isVisible);
+  const challengeVisible = Array.from(document.querySelectorAll(
+    "#challenge-running, #challenge-platform, #cf-spinner, .cf-browser-verification"
+  )).some(isVisible);
+
+  return {{
+    title: document.title || "",
+    url: window.location.href,
+    visibleText: bodyText,
+    occupiedBannerVisible,
+    serviceSelectVisible,
+    selectPlaceholderVisible,
+    telInputVisible,
+    challengeVisible,
+  }};
+}}
+"""
 
 
 def is_target_closed_error(exc: BaseException) -> bool:
@@ -49,17 +114,6 @@ def is_target_closed_error(exc: BaseException) -> bool:
     )
 
 
-def resolve_repo_path(raw: str) -> Path:
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        path = _REPO_ROOT / path
-    return path.resolve()
-
-
-def has_cf_clearance_cookie(cookies: list[dict[str, Any]]) -> bool:
-    return any(str(item.get("name", "")) == "cf_clearance" for item in cookies)
-
-
 def normalize_cdp_url(raw: str | None) -> str | None:
     if raw is None:
         return None
@@ -67,60 +121,68 @@ def normalize_cdp_url(raw: str | None) -> str | None:
     return value or None
 
 
-_PASPORT_HOST_MARKER = "pasport.org.ua"
+def _canonical_page_identity(raw_url: str) -> tuple[str, str, int, str] | None:
+    parsed = urlparse(raw_url)
+    scheme = parsed.scheme.casefold()
+    hostname = parsed.hostname.casefold() if parsed.hostname is not None else ""
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    effective_port = port or (443 if scheme == "https" else 80)
+    path = parsed.path.rstrip("/") or "/"
+    return scheme, hostname, effective_port, path
+
+
+def _redacted_page_location(raw_url: str) -> str:
+    identity = _canonical_page_identity(raw_url)
+    if identity is None:
+        return "non_http_page"
+    scheme, hostname, port, path = identity
+    default_port = 443 if scheme == "https" else 80
+    authority = hostname if port == default_port else f"{hostname}:{port}"
+    return f"{scheme}://{authority}{path}"
 
 
 def page_matches_target_url(page_url: str, target_url: str) -> bool:
+    page_identity = _canonical_page_identity(page_url)
+    target_identity = _canonical_page_identity(target_url)
+    return page_identity is not None and page_identity == target_identity
+
+
+def page_matches_challenge_url(page_url: str, target_url: str) -> bool:
     page = urlparse(page_url)
     target = urlparse(target_url)
-    if not page.netloc or page.netloc.lower() != target.netloc.lower():
+    if (
+        page.hostname is None
+        or target.hostname is None
+        or page.hostname.lower() != target.hostname.lower()
+    ):
         return False
-    page_path = page.path.rstrip("/")
-    target_path = target.path.rstrip("/")
-    return page_path == target_path or page_path.startswith(f"{target_path}/")
+    lowered = page_url.casefold()
+    return "/cdn-cgi/challenge-platform" in lowered or "__cf_chl" in lowered
 
 
 def cdp_tab_matches(page_url: str, target_url: str) -> bool:
-    raw = page_url.strip().lower()
-    if not raw or raw.startswith("about:") or raw.startswith("chrome://"):
-        return False
-    if _PASPORT_HOST_MARKER in raw:
-        return True
-    target = str(target_url).strip().lower().rstrip("/")
-    return bool(target) and (raw.startswith(target) or page_matches_target_url(page_url, target_url))
+    return page_matches_target_url(page_url, target_url)
 
 
-def browser_launch_kwargs(*, headless: bool) -> dict[str, Any]:
-    return {
-        "headless": headless,
-        "args": chrome_launch_args(headless=headless),
-        "ignore_default_args": ["--enable-automation"],
-    }
-
-
-def worker_context_kwargs(settings: Settings, storage_path: Path) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "user_agent": settings.user_agent,
-        "locale": "uk-UA",
-        "timezone_id": "Europe/Warsaw",
-        "color_scheme": "light",
-        "java_script_enabled": True,
-        "extra_http_headers": CHROME_CLIENT_HINTS,
-    }
-    if settings.headless:
-        kwargs["viewport"] = {"width": 1920, "height": 1080}
-        kwargs["screen"] = {"width": 1920, "height": 1080}
-    else:
-        kwargs["no_viewport"] = True
-    if is_usable_storage_state(storage_path):
-        kwargs["storage_state"] = str(storage_path)
-    if settings.proxy_url:
-        kwargs["proxy"] = {"server": settings.proxy_url}
-    return kwargs
-
-
-async def _human_pause(min_s: float = 0.4, max_s: float = 1.8) -> None:
-    await asyncio.sleep(random.uniform(min_s, max_s))
+async def collect_dom_evidence(page: Page) -> SlotPageEvidence:
+    raw = await page.evaluate(_DOM_EVIDENCE_SCRIPT)
+    if not isinstance(raw, dict):
+        raise PlaywrightError("DOM evidence script returned a non-object value")
+    return SlotPageEvidence(
+        title=str(raw.get("title", "")),
+        url=str(raw.get("url", "")),
+        visible_text=str(raw.get("visibleText", "")),
+        occupied_banner_visible=bool(raw.get("occupiedBannerVisible")),
+        service_select_visible=bool(raw.get("serviceSelectVisible")),
+        select_placeholder_visible=bool(raw.get("selectPlaceholderVisible")),
+        tel_input_visible=bool(raw.get("telInputVisible")),
+        challenge_visible=bool(raw.get("challengeVisible")),
+    )
 
 
 class SlotScraper:
@@ -128,185 +190,312 @@ class SlotScraper:
         self._settings = settings
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
-        self._browser_channel: str = "chromium"
-        self._cdp_attached: bool = False
-        self._owns_browser: bool = True
+        self._operation_lock = asyncio.Lock()
+        self._latched_failure: ScraperFailureCode | None = None
+        self._health = ScraperHealthSnapshot(
+            status=ScraperHealthStatus.STOPPED,
+            cdp_connected=False,
+            target_tab_present=False,
+            updated_at=datetime.now(timezone.utc),
+        )
+
+    async def get_health_snapshot(self) -> ScraperHealthSnapshot:
+        return self._health
 
     async def start(self) -> None:
+        async with self._operation_lock:
+            await self._start_unlocked()
+
+    async def stop(self) -> None:
+        async with self._operation_lock:
+            await self._disconnect_unlocked()
+            self._set_health(
+                status=ScraperHealthStatus.STOPPED,
+                cdp_connected=False,
+                target_tab_present=False,
+            )
+
+    async def check_availability(self) -> SlotCheckResult:
+        async with self._operation_lock:
+            try:
+                await self._start_unlocked()
+                page = self._find_target_page()
+                if self._latched_failure is not None:
+                    return await self._probe_latched_page(page)
+                return await self._reload_and_classify(page)
+            except HumanActionRequiredError as exc:
+                self._latch_human_action(exc)
+                raise
+            except asyncio.CancelledError:
+                raise
+            except PlaywrightError as exc:
+                if is_target_closed_error(exc):
+                    failure = TargetTabClosedError(
+                        "target queue tab closed during DOM inspection"
+                    )
+                    self._latch_human_action(failure)
+                    raise failure from exc
+                if self._browser is None or not self._browser.is_connected():
+                    failure = CdpUnavailableError(
+                        "CDP Chrome disconnected during DOM inspection"
+                    )
+                    await self._disconnect_unlocked()
+                    self._latch_human_action(failure)
+                    raise failure from exc
+                logger.exception(
+                    "scraper_failed",
+                    extra={"city": self._settings.city_name, "error": str(exc)},
+                )
+                return self._unknown_result(
+                    ScraperFailureCode.SCRAPER_ERROR,
+                    str(exc),
+                )
+
+    async def _start_unlocked(self) -> None:
         if self._browser is not None and self._browser.is_connected():
             return
-        if self._browser is not None:
-            await self._reset()
-        self._playwright = await async_playwright().start()
+        await self._disconnect_unlocked()
         cdp_url = normalize_cdp_url(self._settings.cdp_url)
-        if cdp_url is not None:
-            try:
-                self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
-                self._cdp_attached = True
-                self._owns_browser = False
-                self._browser_channel = "cdp"
-            except (PlaywrightError, OSError) as exc:
-                logger.warning(
-                    "cdp_connect_failed",
-                    extra={"cdp_url": cdp_url, "error": str(exc)},
-                )
-                await self._launch_owned_browser()
-        else:
-            await self._launch_owned_browser()
-        storage = resolve_repo_path(self._settings.storage_state_path)
+        if cdp_url is None:
+            raise CdpUnavailableError("CDP_URL is required in strict CDP mode")
+        self._set_health(
+            status=ScraperHealthStatus.STARTING,
+            cdp_connected=False,
+            target_tab_present=False,
+        )
+        try:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.connect_over_cdp(
+                cdp_url,
+                timeout=_CDP_CONNECT_TIMEOUT_MS,
+            )
+        except (PlaywrightError, OSError) as exc:
+            await self._disconnect_unlocked()
+            raise CdpUnavailableError(
+                f"cannot connect to configured CDP endpoint: {cdp_url}"
+            ) from exc
         logger.info(
             "scraper_started",
             extra={
                 "city": self._settings.city_name,
-                "headless": self._settings.headless,
-                "channel": self._browser_channel,
-                "cdp_attached": self._cdp_attached,
-                "storage_state": str(storage),
-                "storage_state_exists": is_usable_storage_state(storage),
+                "channel": "cdp",
+                "cdp_url": cdp_url,
             },
         )
-
-    async def _launch_owned_browser(self) -> None:
-        assert self._playwright is not None
-        self._cdp_attached = False
-        self._owns_browser = True
-        launch = browser_launch_kwargs(headless=self._settings.headless)
-        try:
-            self._browser = await self._playwright.chromium.launch(channel="chrome", **launch)
-            self._browser_channel = "chrome"
-        except PlaywrightError as extra:
-            logger.warning("system_chrome_unavailable", extra={"error": str(extra)})
-            self._browser = await self._playwright.chromium.launch(**launch)
-            self._browser_channel = "chromium"
-
-    async def stop(self) -> None:
-        if self._owns_browser:
-            await self._close_browser()
-        else:
-            self._browser = None
-            self._cdp_attached = False
-        if self._playwright is not None:
-            try:
-                await self._playwright.stop()
-            except PlaywrightError as extra:
-                logger.warning("playwright_stop_failed", extra={"error": str(extra)})
-            self._playwright = None
-
-    async def check_availability(self) -> SlotCheckResult:
-        last_unknown: SlotCheckResult | None = None
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
-            context: BrowserContext | None = None
-            page: Page | None = None
-            close_page = False
-            close_context = False
-            try:
-                await self.start()
-                assert self._browser is not None
-                context, page, close_page, close_context = await self._open_worker_page()
-                return await self._inspect_page(page)
-            except SessionExpiredException as exc:
-                logger.warning(
-                    "session_expired",
-                    extra={"city": self._settings.city_name, "error": str(exc)},
-                )
-                return SlotCheckResult(
-                    status=SlotStatus.UNKNOWN,
-                    checked_at=datetime.now(timezone.utc),
-                    error="session_expired",
-                    details=str(exc),
-                )
-            except (NetworkTimeoutError, PlaywrightTimeoutError) as extra:
-                logger.warning(
-                    "scraper_timeout",
-                    extra={
-                        "city": self._settings.city_name,
-                        "attempt": attempt,
-                        "error": str(extra),
-                    },
-                )
-                last_unknown = SlotCheckResult(
-                    status=SlotStatus.UNKNOWN,
-                    checked_at=datetime.now(timezone.utc),
-                    error="timeout",
-                    details=str(extra),
-                )
-            except (ScraperError, PlaywrightError, OSError) as extra:
-                closed = is_target_closed_error(extra)
-                log = logger.warning if closed else logger.exception
-                log(
-                    "browser_context_closed" if closed else "scraper_failed",
-                    extra={
-                        "city": self._settings.city_name,
-                        "attempt": attempt,
-                        "error": str(extra),
-                    },
-                )
-                last_unknown = SlotCheckResult(
-                    status=SlotStatus.UNKNOWN,
-                    checked_at=datetime.now(timezone.utc),
-                    error="scraper_error",
-                    details=str(extra),
-                )
-                if self._owns_browser or self._browser is None or not self._browser.is_connected():
-                    await self._reset()
-            finally:
-                if close_page:
-                    await self._close_page(page)
-                if close_context:
-                    await self._close_context(context)
-            if attempt < _MAX_ATTEMPTS:
-                delay = 3.0 + random.uniform(0.4, 1.6)
-                logger.info(
-                    "scraper_retry",
-                    extra={"city": self._settings.city_name, "attempt": attempt, "delay": round(delay, 2)},
-                )
-                await asyncio.sleep(delay)
-        return last_unknown or SlotCheckResult(
-            status=SlotStatus.UNKNOWN,
-            checked_at=datetime.now(timezone.utc),
-            error="scraper_error",
-            details="exhausted scraper attempts",
+        self._set_health(
+            status=ScraperHealthStatus.READY,
+            cdp_connected=True,
+            target_tab_present=False,
         )
 
-    async def _open_worker_page(self) -> tuple[BrowserContext, Page, bool, bool]:
-        assert self._browser is not None
-        if self._cdp_attached:
-            return await self._open_cdp_page()
-        storage = resolve_repo_path(self._settings.storage_state_path)
-        context = await self._browser.new_context(**worker_context_kwargs(self._settings, storage))
-        await context.add_init_script(STEALTH_INIT_SCRIPT)
-        await stealth_async(context)
-        page = await context.new_page()
-        return context, page, True, True
+    async def _disconnect_unlocked(self) -> None:
+        self._browser = None
+        playwright = self._playwright
+        self._playwright = None
+        if playwright is None:
+            return
+        try:
+            await playwright.stop()
+        except PlaywrightError as exc:
+            logger.warning(
+                "playwright_stop_failed",
+                extra={"city": self._settings.city_name, "error": str(exc)},
+            )
 
-    async def _open_cdp_page(self) -> tuple[BrowserContext, Page, bool, bool]:
-        assert self._browser is not None
-        if not self._browser.contexts:
-            raise ScraperError("CDP Chrome has no open context")
-        target = str(self._settings.target_url)
-        ranked: list[tuple[int, BrowserContext, Page]] = []
-        for context in self._browser.contexts:
+    def _find_target_page(self) -> Page:
+        browser = self._browser
+        if browser is None or not browser.is_connected():
+            raise CdpUnavailableError("CDP Chrome is not connected")
+        target_url = str(self._settings.target_url)
+        challenge_page_found = False
+        open_locations: list[str] = []
+        for context in browser.contexts:
             for page in context.pages:
                 if self._page_is_closed(page):
                     continue
-                url = self._page_url(page)
-                if not cdp_tab_matches(url, target):
-                    continue
-                rank = 0 if page_matches_target_url(url, target) or url.lower().startswith(
-                    target.lower().rstrip("/")
-                ) else 1
-                ranked.append((rank, context, page))
-        if not ranked:
-            raise ScraperError(
-                "CDP Chrome has no open pasport.org.ua tab; open TARGET_URL in the debug Chrome window"
+                page_url = self._page_url(page)
+                open_locations.append(_redacted_page_location(page_url))
+                if page_matches_target_url(page_url, target_url):
+                    latched = self._latched_failure is not None
+                    self._set_health(
+                        status=(
+                            ScraperHealthStatus.NEEDS_HUMAN
+                            if latched
+                            else ScraperHealthStatus.READY
+                        ),
+                        cdp_connected=True,
+                        target_tab_present=True,
+                        failure_code=self._latched_failure,
+                        details=self._health.details if latched else "",
+                    )
+                    return page
+                challenge_page_found = (
+                    challenge_page_found
+                    or page_matches_challenge_url(page_url, target_url)
+                )
+        if challenge_page_found:
+            raise CloudflareChallengeError(
+                "target tab is showing a Cloudflare challenge"
             )
-        ranked.sort(key=lambda item: item[0])
-        _rank, context, page = ranked[0]
-        logger.info(
-            "cdp_reusing_target_tab",
-            extra={"city": self._settings.city_name, "open_tabs": len(context.pages)},
+        logger.warning(
+            "cdp_target_tab_not_found",
+            extra={
+                "city": self._settings.city_name,
+                "open_tabs": len(open_locations),
+                "tab_locations": open_locations,
+            },
         )
-        return context, page, False, False
+        raise TargetTabMissingError(
+            "CDP Chrome has no exact TARGET_URL tab; open and clear it manually"
+        )
+
+    async def _reload_and_classify(self, page: Page) -> SlotCheckResult:
+        try:
+            await page.reload(
+                wait_until="domcontentloaded",
+                timeout=_CDP_RELOAD_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError as exc:
+            if self._page_is_closed(page):
+                raise TargetTabClosedError("target tab closed during soft reload") from exc
+            evidence = await collect_dom_evidence(page)
+            if has_cloudflare_challenge(evidence):
+                raise CloudflareChallengeError(
+                    "Cloudflare challenge appeared during soft reload"
+                ) from exc
+            return self._unknown_result(
+                ScraperFailureCode.NAVIGATION_TIMEOUT,
+                "target tab soft reload exceeded 15 seconds",
+            )
+        except PlaywrightError as exc:
+            if is_target_closed_error(exc) or self._page_is_closed(page):
+                raise TargetTabClosedError("target tab closed during soft reload") from exc
+            raise
+        return await self._wait_for_decisive_evidence(page)
+
+    async def _probe_latched_page(self, page: Page) -> SlotCheckResult:
+        evidence = await collect_dom_evidence(page)
+        result = classify_slot_evidence(evidence)
+        if has_cloudflare_challenge(evidence):
+            raise CloudflareChallengeError(
+                "target tab still requires Cloudflare verification"
+            )
+        if result.status is SlotStatus.UNKNOWN:
+            return result
+        self._latched_failure = None
+        self._set_health(
+            status=ScraperHealthStatus.READY,
+            cdp_connected=True,
+            target_tab_present=True,
+        )
+        logger.info(
+            "scraper_human_action_recovered",
+            extra={"city": self._settings.city_name},
+        )
+        return result
+
+    async def _wait_for_decisive_evidence(self, page: Page) -> SlotCheckResult:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (_DOM_SIGNAL_TIMEOUT_MS / 1000)
+        last_result: SlotCheckResult | None = None
+        candidate_status: SlotStatus | None = None
+        candidate_since: float | None = None
+        while True:
+            evidence = await collect_dom_evidence(page)
+            if has_cloudflare_challenge(evidence):
+                raise CloudflareChallengeError(
+                    "Cloudflare challenge appeared after soft reload"
+                )
+            last_result = classify_slot_evidence(evidence)
+            if last_result.status is not SlotStatus.UNKNOWN:
+                if candidate_status is not last_result.status:
+                    candidate_status = last_result.status
+                    candidate_since = loop.time()
+                elif (
+                    candidate_since is not None
+                    and loop.time() - candidate_since >= _DOM_STABILITY_SECONDS
+                ):
+                    self._latched_failure = None
+                    self._set_health(
+                        status=ScraperHealthStatus.READY,
+                        cdp_connected=True,
+                        target_tab_present=True,
+                    )
+                    return last_result
+            else:
+                candidate_status = None
+                candidate_since = None
+            if loop.time() >= deadline:
+                return self._unknown_result(
+                    ScraperFailureCode.INCONCLUSIVE_PAGE,
+                    (
+                        "visible slot-state evidence did not remain stable"
+                        if candidate_status is not None
+                        else last_result.details
+                    ),
+                )
+            await asyncio.sleep(_DOM_POLL_SECONDS)
+
+    def _unknown_result(
+        self,
+        failure_code: ScraperFailureCode,
+        details: str,
+    ) -> SlotCheckResult:
+        self._set_health(
+            status=ScraperHealthStatus.DEGRADED,
+            cdp_connected=self._browser is not None and self._browser.is_connected(),
+            target_tab_present=failure_code is not ScraperFailureCode.TARGET_TAB_MISSING,
+            failure_code=failure_code,
+            details=details,
+        )
+        return SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=datetime.now(timezone.utc),
+            error=failure_code.value,
+            failure_code=failure_code,
+            details=details,
+        )
+
+    def _latch_human_action(self, exc: HumanActionRequiredError) -> None:
+        self._latched_failure = exc.failure_code
+        connected = self._browser is not None and self._browser.is_connected()
+        self._set_health(
+            status=ScraperHealthStatus.NEEDS_HUMAN,
+            cdp_connected=connected,
+            target_tab_present=exc.failure_code
+            not in {
+                ScraperFailureCode.CDP_UNAVAILABLE,
+                ScraperFailureCode.TARGET_TAB_MISSING,
+            },
+            failure_code=exc.failure_code,
+            details=str(exc),
+        )
+        logger.warning(
+            "scraper_human_action_required",
+            extra={
+                "city": self._settings.city_name,
+                "failure_code": exc.failure_code.value,
+                "error": str(exc),
+            },
+        )
+
+    def _set_health(
+        self,
+        *,
+        status: ScraperHealthStatus,
+        cdp_connected: bool,
+        target_tab_present: bool,
+        failure_code: ScraperFailureCode | None = None,
+        details: str = "",
+    ) -> None:
+        self._health = ScraperHealthSnapshot(
+            status=status,
+            cdp_connected=cdp_connected,
+            target_tab_present=target_tab_present,
+            updated_at=datetime.now(timezone.utc),
+            failure_code=failure_code,
+            details=details,
+        )
 
     def _page_is_closed(self, page: Page) -> bool:
         try:
@@ -323,148 +512,3 @@ class SlotScraper:
             if is_target_closed_error(exc):
                 return ""
             raise
-
-    async def _inspect_page(self, page: Page) -> SlotCheckResult:
-        payloads: list[Any] = []
-
-        async def _capture_response(response: Any) -> None:
-            content_type = (response.headers.get("content-type") or "").lower()
-            if "json" not in content_type:
-                return
-            try:
-                body = await response.text()
-            except (PlaywrightError, OSError, UnicodeDecodeError):
-                return
-            parsed = dumps_payload(body)
-            if parsed is not None:
-                payloads.append(parsed)
-
-        if self._page_is_closed(page):
-            raise ScraperError("CDP tab was closed before inspect")
-        page.on("response", _capture_response)
-        try:
-            timeout = self._settings.playwright_timeout_ms
-            if not self._cdp_attached:
-                await stealth_async(page)
-            await _human_pause(0.3, 1.2)
-            await self._load_worker_page(page, timeout)
-            await _human_pause(0.5, 1.2)
-            title, html = await self._read_page(page)
-            if is_cloudflare_challenge(title=title, html=html):
-                raise SessionExpiredException("Cloudflare challenge interstitial; storage_state must be refreshed")
-
-            try:
-                await page.wait_for_load_state("networkidle", timeout=min(timeout, 20_000))
-            except PlaywrightTimeoutError:
-                logger.info("networkidle_skipped", extra={"city": self._settings.city_name})
-            except PlaywrightError as extra:
-                if is_target_closed_error(extra):
-                    raise ScraperError("CDP tab closed while waiting for networkidle") from extra
-                raise
-
-            await self._select_service(page)
-            await _human_pause(0.4, 1.0)
-            title, html = await self._read_page(page)
-            if is_cloudflare_challenge(title=title, html=html):
-                raise SessionExpiredException("Cloudflare challenge interstitial after load")
-
-            return parse_slot_page(
-                html=html,
-                title=title,
-                json_payloads=payloads,
-                checked_at=datetime.now(timezone.utc),
-            )
-        finally:
-            try:
-                page.remove_listener("response", _capture_response)
-            except (PlaywrightError, AttributeError) as extra:
-                logger.warning("response_listener_remove_failed", extra={"error": str(extra)})
-
-    async def _load_worker_page(self, page: Page, timeout: int) -> None:
-        if self._page_is_closed(page):
-            raise ScraperError("CDP tab was closed before load")
-        try:
-            if self._cdp_attached:
-                await page.reload(wait_until="domcontentloaded", timeout=timeout)
-            else:
-                await page.goto(
-                    str(self._settings.target_url),
-                    wait_until="domcontentloaded",
-                    timeout=timeout,
-                )
-        except PlaywrightTimeoutError as extra:
-            raise NetworkTimeoutError(str(extra)) from extra
-        except PlaywrightError as extra:
-            if is_target_closed_error(extra):
-                raise ScraperError("CDP tab closed during reload") from extra
-            raise
-
-    async def _read_page(self, page: Page) -> tuple[str, str]:
-        if self._page_is_closed(page):
-            raise ScraperError("CDP tab was closed during read")
-        try:
-            title = await page.title()
-            html = await page.content()
-        except PlaywrightError as extra:
-            if is_target_closed_error(extra):
-                raise ScraperError("CDP tab closed while reading page") from extra
-            raise
-        return title, html
-
-    async def _select_service(self, page: Page) -> None:
-        label = self._settings.service_option
-        if not label or self._page_is_closed(page):
-            return
-        try:
-            select = page.locator("select").first
-            if await select.count() > 0:
-                await select.select_option(label=label)
-                await _human_pause()
-                return
-            option = page.get_by_role("option", name=label)
-            if await option.count() > 0:
-                await option.first.click()
-                await _human_pause()
-                return
-            text_match = page.get_by_text(label, exact=False).first
-            if await text_match.count() > 0:
-                await text_match.click()
-                await _human_pause()
-        except PlaywrightError as extra:
-            if is_target_closed_error(extra):
-                logger.warning("service_option_skipped_tab_closed", extra={"label": label})
-                return
-            logger.warning(
-                "service_option_not_selected",
-                extra={"label": label, "error": str(extra)},
-            )
-
-    async def _close_page(self, page: Page | None) -> None:
-        if page is None:
-            return
-        try:
-            if not page.is_closed():
-                await page.close()
-        except PlaywrightError as extra:
-            logger.warning("page_close_failed", extra={"error": str(extra)})
-
-    async def _close_context(self, context: BrowserContext | None) -> None:
-        if context is None:
-            return
-        try:
-            await context.close()
-        except PlaywrightError as extra:
-            logger.warning("context_close_failed", extra={"error": str(extra)})
-
-    async def _close_browser(self) -> None:
-        if self._browser is None:
-            return
-        try:
-            if self._browser.is_connected():
-                await self._browser.close()
-        except PlaywrightError as extra:
-            logger.warning("browser_close_failed", extra={"error": str(extra)})
-        self._browser = None
-
-    async def _reset(self) -> None:
-        await self.stop()

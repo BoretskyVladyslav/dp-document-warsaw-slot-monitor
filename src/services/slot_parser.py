@@ -1,288 +1,107 @@
 from __future__ import annotations
 
-import json
 import re
-from datetime import date, datetime, timezone
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
-from src.core.models import SlotCheckResult, SlotStatus
+from src.core.models import ScraperFailureCode, SlotCheckResult, SlotStatus
 
-OCCUPIED_PHRASES: tuple[str, ...] = (
-    "наразі всі місця зайняті",
-    "будь ласка, спробуйте в інший час або день",
-)
+_WHITESPACE_RE = re.compile(r"\s+")
+_DASH_RE = re.compile(r"[–—−]")
 
-NO_SLOT_PHRASES: tuple[str, ...] = (
-    *OCCUPIED_PHRASES,
-    "немає вільних",
-    "немає доступних",
-    "немає вільних дат",
-    "немає вільних талонів",
-    "відсутні вільні",
-    "брак вільних",
-    "нет свободных",
-    "no available slots",
-    "no slots available",
-    "currently no available",
-    "brak wolnych",
-    "brak dostępnych",
-    "немає вільних місць",
-    "немає доступних дат",
-    "вільних талонів немає",
-    "no dates available",
-)
-
-_SERVICE_LABEL = "послуга"
-_SELECT_PLACEHOLDER = "- обрати -"
-_TEL_INPUT_RE = re.compile(
-    r"""<input\b[^>]*\btype\s*=\s*["']tel["']""",
-    re.IGNORECASE,
-)
-_SELECT_TAG_RE = re.compile(r"<select\b", re.IGNORECASE)
+OCCUPIED_HEADING = "наразі всі місця зайняті"
+OCCUPIED_INSTRUCTION = "будь ласка, спробуйте в інший час або день"
+SERVICE_LABEL = "послуга"
+SELECT_PLACEHOLDER = "- обрати -"
 
 _CF_TITLE_MARKERS: tuple[str, ...] = (
     "just a moment",
     "checking your browser",
     "attention required",
 )
-_CF_OVERLAY_MARKERS: tuple[str, ...] = (
-    "cf-browser-verification",
-    "challenge-running",
-    "__cf_chl",
+_CF_URL_MARKERS: tuple[str, ...] = (
+    "/cdn-cgi/challenge-platform",
 )
 
-_DATE_RE = re.compile(
-    r"\b(\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4}|\d{2}/\d{2}/\d{4})\b"
-)
-_TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
-_ARIA_DISABLED_TRUE_RE = re.compile(
-    r"""aria-disabled\s*=\s*["']true["']""",
-    re.IGNORECASE,
-)
-_DISABLED_ATTR_RE = re.compile(r"""(?:\s|<)disabled(?:\s|>|/|=)""", re.IGNORECASE)
+
+@dataclass(frozen=True, slots=True)
+class SlotPageEvidence:
+    title: str
+    url: str
+    visible_text: str
+    occupied_banner_visible: bool
+    service_select_visible: bool
+    select_placeholder_visible: bool
+    tel_input_visible: bool
+    challenge_visible: bool
 
 
-def is_cloudflare_challenge(*, title: str, html: str) -> bool:
-    title_l = title.lower()
-    if any(marker in title_l for marker in _CF_TITLE_MARKERS):
-        return True
-    html_l = html.lower()
-    return any(marker in html_l for marker in _CF_OVERLAY_MARKERS)
+def normalize_visible_text(value: str) -> str:
+    normalized_dashes = _DASH_RE.sub("-", value.casefold())
+    return _WHITESPACE_RE.sub(" ", normalized_dashes).strip()
 
 
-def parse_slot_page(
+def has_cloudflare_challenge(evidence: SlotPageEvidence) -> bool:
+    title = normalize_visible_text(evidence.title)
+    url = evidence.url.casefold()
+    return (
+        evidence.challenge_visible
+        or any(marker in title for marker in _CF_TITLE_MARKERS)
+        or any(marker in url for marker in _CF_URL_MARKERS)
+    )
+
+
+def classify_slot_evidence(
+    evidence: SlotPageEvidence,
     *,
-    html: str,
-    title: str,
-    json_payloads: list[Any],
     checked_at: datetime | None = None,
 ) -> SlotCheckResult:
     moment = checked_at or datetime.now(timezone.utc)
-    if is_cloudflare_challenge(title=title, html=html):
+    if has_cloudflare_challenge(evidence):
         return SlotCheckResult(
             status=SlotStatus.UNKNOWN,
             checked_at=moment,
-            error="cloudflare_challenge",
+            error=ScraperFailureCode.CLOUDFLARE_CHALLENGE.value,
+            failure_code=ScraperFailureCode.CLOUDFLARE_CHALLENGE,
             details="Cloudflare challenge page detected",
         )
 
-    normalized = _normalize_ui_text(html)
-    if _has_occupied_message(normalized):
+    visible_text = normalize_visible_text(evidence.visible_text)
+    occupied_text_present = (
+        OCCUPIED_HEADING in visible_text
+        and OCCUPIED_INSTRUCTION in visible_text
+    )
+    occupied = evidence.occupied_banner_visible and occupied_text_present
+    complete_form = (
+        evidence.service_select_visible
+        and evidence.select_placeholder_visible
+        and evidence.tel_input_visible
+    )
+
+    if occupied and complete_form:
+        return SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=moment,
+            error=ScraperFailureCode.INCONCLUSIVE_PAGE.value,
+            failure_code=ScraperFailureCode.INCONCLUSIVE_PAGE,
+            details="conflicting visible occupied banner and booking form",
+        )
+    if occupied:
         return SlotCheckResult(
             status=SlotStatus.NO_SLOTS,
             checked_at=moment,
-            details="occupied message: Наразі всі місця зайняті",
+            details="visible occupied banner",
         )
-
-    json_slots, json_explicit_empty = _extract_slots_from_payloads(json_payloads)
-    dom_slots = _extract_slots_from_html(html)
-    slots = tuple(dict.fromkeys([*json_slots, *dom_slots]))
-
-    if slots:
-        preview = ", ".join(slots[:12])
+    if complete_form:
         return SlotCheckResult(
             status=SlotStatus.FREE_SLOTS_AVAILABLE,
             checked_at=moment,
-            details=preview,
-            slots=slots,
+            details="visible service selector and telephone field",
         )
-
-    if _has_booking_form(html, normalized):
-        return SlotCheckResult(
-            status=SlotStatus.FREE_SLOTS_AVAILABLE,
-            checked_at=moment,
-            details="booking form visible (Послуга / phone)",
-        )
-
-    if json_explicit_empty or any(phrase in normalized for phrase in NO_SLOT_PHRASES):
-        return SlotCheckResult(
-            status=SlotStatus.NO_SLOTS,
-            checked_at=moment,
-            details="no available dates or times",
-        )
-
     return SlotCheckResult(
         status=SlotStatus.UNKNOWN,
         checked_at=moment,
-        details="page did not contain a conclusive slot signal",
+        error=ScraperFailureCode.INCONCLUSIVE_PAGE.value,
+        failure_code=ScraperFailureCode.INCONCLUSIVE_PAGE,
+        details="page did not contain a complete visible slot-state signal",
     )
-
-
-def _normalize_ui_text(html: str) -> str:
-    lowered = html.lower()
-    return lowered.replace("–", "-").replace("—", "-").replace("−", "-")
-
-
-def _has_occupied_message(normalized_html: str) -> bool:
-    return any(phrase in normalized_html for phrase in OCCUPIED_PHRASES)
-
-
-def _has_booking_form(html: str, normalized_html: str) -> bool:
-    has_placeholder = _SELECT_PLACEHOLDER in normalized_html
-    has_service_label = _SERVICE_LABEL in normalized_html
-    has_tel = bool(_TEL_INPUT_RE.search(html))
-    has_select = bool(_SELECT_TAG_RE.search(html))
-    return has_tel or (has_select and has_placeholder) or (has_service_label and has_placeholder)
-
-
-def _extract_slots_from_payloads(payloads: list[Any]) -> tuple[list[str], bool]:
-    found: list[str] = []
-    explicit_empty = False
-    for payload in payloads:
-        items, empty = _walk_json(payload)
-        found.extend(items)
-        explicit_empty = explicit_empty or empty
-    return found, explicit_empty and not found
-
-
-def _walk_json(node: Any) -> tuple[list[str], bool]:
-    found: list[str] = []
-    explicit_empty = False
-
-    def visit(value: Any) -> None:
-        nonlocal explicit_empty
-        if isinstance(value, dict):
-            slot = _slot_from_dict(value)
-            if slot:
-                found.append(slot)
-            for key, child in value.items():
-                key_l = str(key).lower()
-                if key_l in {"slots", "dates", "times", "tickets", "availabledates"}:
-                    if isinstance(child, list) and len(child) == 0:
-                        explicit_empty = True
-                visit(child)
-        elif isinstance(value, list):
-            for item in value:
-                visit(item)
-
-    visit(node)
-    return found, explicit_empty
-
-
-def _slot_from_dict(item: dict[str, Any]) -> str | None:
-    available = item.get("available", item.get("isAvailable", item.get("free")))
-    if available is False or str(available).strip().lower() in {"0", "false", "no"}:
-        return None
-    if isinstance(available, (int, float)) and int(available) <= 0:
-        return None
-
-    date_raw = item.get("date") or item.get("day") or item.get("datetime")
-    time_raw = item.get("time") or item.get("hour")
-    if date_raw is None and time_raw is None:
-        return None
-    if not _is_future_or_today(str(date_raw) if date_raw is not None else None):
-        return None
-    parts = [str(date_raw)] if date_raw is not None else []
-    if time_raw is not None:
-        parts.append(str(time_raw))
-    return " ".join(parts)
-
-
-def _is_future_or_today(raw: str | None) -> bool:
-    if raw is None:
-        return True
-    parsed = _parse_date(raw)
-    if parsed is None:
-        return True
-    return parsed >= date.today()
-
-
-def _parse_date(raw: str) -> date | None:
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(raw[:10], fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
-def _is_disabled_element(tag: str) -> bool:
-    return bool(_ARIA_DISABLED_TRUE_RE.search(tag) or _DISABLED_ATTR_RE.search(tag))
-
-
-def _extract_slots_from_html(html: str) -> list[str]:
-    slots: list[str] = []
-    attr_pattern = re.compile(
-        r"""(?:data-date|data-day|data-time|data-slot|data-day-value)\s*=\s*["']([^"']+)["']""",
-        re.IGNORECASE,
-    )
-    for match in attr_pattern.finditer(html):
-        value = match.group(1).strip()
-        if _looks_like_slot(value):
-            slots.append(value)
-
-    available_attr = re.compile(
-        r"""<(?:button|td|div|span|a)[^>]*data-available\s*=\s*["']true["'][^>]*>(.*?)</(?:button|td|div|span|a)>""",
-        re.IGNORECASE | re.DOTALL,
-    )
-    for match in available_attr.finditer(html):
-        tag = match.group(0)
-        if _is_disabled_element(tag):
-            continue
-        extracted = _dates_and_times_from_text(tag + " " + match.group(1))
-        slots.extend(extracted)
-
-    class_available = re.compile(
-        r"""<(?:button|td|div|span|a)[^>]*class=["'][^"']*\b(?:available|free|enabled|is-available|day-available|has-slots|is-not-disabled)\b[^"']*["'][^>]*>(.*?)</(?:button|td|div|span|a)>""",
-        re.IGNORECASE | re.DOTALL,
-    )
-    for match in class_available.finditer(html):
-        tag = match.group(0)
-        if _is_disabled_element(tag):
-            continue
-        text = re.sub(r"<[^>]+>", " ", match.group(1))
-        extracted = _dates_and_times_from_text(text)
-        slots.extend(extracted)
-
-    aria_date = re.compile(
-        r"""<(?:button|td|div)[^>]*aria-label=["']([^"']+)["'][^>]*(?:aria-disabled=["']false["'])?[^>]*>""",
-        re.IGNORECASE,
-    )
-    for match in aria_date.finditer(html):
-        label = match.group(1)
-        tag = match.group(0)
-        if _is_disabled_element(tag):
-            continue
-        extracted = _dates_and_times_from_text(label)
-        slots.extend(extracted)
-
-    return [item for item in slots if _is_future_or_today(item.split()[0] if item else None)]
-
-
-def _looks_like_slot(value: str) -> bool:
-    return bool(_DATE_RE.search(value) or _TIME_RE.search(value))
-
-
-def _dates_and_times_from_text(text: str) -> list[str]:
-    dates = _DATE_RE.findall(text)
-    times = _TIME_RE.findall(text)
-    if dates and times:
-        return [f"{day} {time}" for day in dates for time in times]
-    return [*dates, *times]
-
-
-def dumps_payload(raw: str) -> Any | None:
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return None

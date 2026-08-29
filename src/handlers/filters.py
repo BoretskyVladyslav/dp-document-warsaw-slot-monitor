@@ -7,5 +7,4 @@ class AdminFilter(BaseFilter):
         self._admin_ids = admin_ids
 
     async def __call__(self, message: Message) -> bool:
-        user = message.from_user
-        return user is not None and user.id in self._admin_ids
+        return message.chat.id in self._admin_ids

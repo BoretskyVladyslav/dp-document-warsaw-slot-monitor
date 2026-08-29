@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+
+from src.core.config import Settings
+from src.core.exceptions import CloudflareChallengeError, HumanActionRequiredError
+from src.core.models import (
+    ScraperHealthSnapshot,
+    ScraperHealthStatus,
+    SlotCheckResult,
+    SlotStatus,
+)
+from src.database.connection import Database
+from src.database.monitor_state import get_monitor_state
+from src.database.schema import init_schema
+from src.services.monitor import SlotMonitor
+
+TARGET_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
+
+
+class BlockingScraper:
+    def __init__(
+        self,
+        result: SlotCheckResult | None = None,
+        error: HumanActionRequiredError | None = None,
+    ) -> None:
+        self.result = result
+        self.error = error
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def check_availability(self) -> SlotCheckResult:
+        self.calls += 1
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+    async def get_health_snapshot(self) -> ScraperHealthSnapshot:
+        return ScraperHealthSnapshot(
+            status=ScraperHealthStatus.READY,
+            cdp_connected=True,
+            target_tab_present=True,
+            updated_at=datetime.now(timezone.utc),
+        )
+
+
+class FakeNotifier:
+    def __init__(self) -> None:
+        self.verified: list[SlotCheckResult] = []
+        self.incidents: list[HumanActionRequiredError] = []
+        self.drain_calls = 0
+
+    async def handle_verified_result(self, result: SlotCheckResult) -> bool:
+        self.verified.append(result)
+        return True
+
+    async def handle_human_action_required(
+        self,
+        error: HumanActionRequiredError,
+        *,
+        attempted_at: datetime,
+    ) -> bool:
+        del attempted_at
+        self.incidents.append(error)
+        return True
+
+    async def drain_outbox(self) -> object:
+        self.drain_calls += 1
+        return object()
+
+
+class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self._tmp.name) / "monitor.db"))
+        await self.db.connect()
+        await init_schema(self.db.connection)
+        self.settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url=TARGET_URL,
+            city_name="Warsaw",
+            cdp_url="http://127.0.0.1:9222",
+            _env_file=None,
+        )
+        self.checked_at = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+        self._tmp.cleanup()
+
+    def _monitor(
+        self,
+        scraper: BlockingScraper,
+        notifier: FakeNotifier,
+    ) -> SlotMonitor:
+        return SlotMonitor(
+            settings=self.settings,
+            database=self.db,
+            scraper=scraper,  # type: ignore[arg-type]
+            notifier=notifier,  # type: ignore[arg-type]
+            started_at=self.checked_at,
+        )
+
+    async def test_scheduled_and_manual_checks_share_one_inflight_task(self) -> None:
+        result = SlotCheckResult(
+            status=SlotStatus.NO_SLOTS,
+            checked_at=self.checked_at,
+            details="visible occupied banner",
+        )
+        scraper = BlockingScraper(result=result)
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+
+        scheduled = asyncio.create_task(monitor.run_once())
+        await scraper.entered.wait()
+        manual = asyncio.create_task(monitor.check_now())
+        await asyncio.sleep(0)
+        self.assertEqual(scraper.calls, 1)
+
+        scraper.release.set()
+        scheduled_result, manual_result = await asyncio.gather(scheduled, manual)
+
+        self.assertIs(scheduled_result, manual_result)
+        self.assertEqual(scraper.calls, 1)
+        self.assertEqual(notifier.verified, [result])
+        self.assertEqual(notifier.drain_calls, 1)
+
+    async def test_human_action_error_becomes_unknown_without_crashing(self) -> None:
+        failure = CloudflareChallengeError("challenge visible")
+        scraper = BlockingScraper(error=failure)
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+        scraper.release.set()
+
+        result = await monitor.run_once()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.error, "cloudflare_challenge")
+        self.assertEqual(notifier.incidents, [failure])
+        self.assertEqual(notifier.drain_calls, 1)
+
+    async def test_nonconclusive_result_persists_attempt_not_verified_state(
+        self,
+    ) -> None:
+        result = SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=self.checked_at,
+            details="incomplete DOM",
+            error="inconclusive_page",
+        )
+        scraper = BlockingScraper(result=result)
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+        scraper.release.set()
+
+        returned = await monitor.run_once()
+        state = await get_monitor_state(self.db.connection, "warsaw")
+
+        self.assertIs(returned, result)
+        assert state is not None
+        self.assertEqual(state.verified_state, SlotStatus.UNKNOWN)
+        self.assertEqual(state.last_attempt_at, self.checked_at)
+        self.assertEqual(state.last_error, "inconclusive_page")
+        self.assertEqual(notifier.verified, [])
+
+    async def test_cancelling_monitor_run_cancels_and_awaits_inflight_cycle(
+        self,
+    ) -> None:
+        scraper = BlockingScraper(
+            result=SlotCheckResult(
+                status=SlotStatus.NO_SLOTS,
+                checked_at=self.checked_at,
+            )
+        )
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+        run_task = asyncio.create_task(monitor.run(asyncio.Event()))
+        await scraper.entered.wait()
+
+        run_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await run_task
+
+        self.assertTrue(scraper.cancelled.is_set())
+        with self.assertRaisesRegex(RuntimeError, "shutting down"):
+            await monitor.check_now()
+
+
+if __name__ == "__main__":
+    unittest.main()

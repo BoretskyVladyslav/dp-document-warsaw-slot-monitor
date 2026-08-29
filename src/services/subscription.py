@@ -16,15 +16,18 @@ class SubscriptionService:
         chat_id: int,
         username: str | None,
     ) -> Subscriber:
-        return await add_subscriber(
-            self._database.connection,
-            user_id=user_id,
-            chat_id=chat_id,
-            username=username,
-        )
+        async with self._database.write_lock:
+            return await add_subscriber(
+                self._database.connection,
+                user_id=user_id,
+                chat_id=chat_id,
+                username=username,
+            )
 
     async def unsubscribe(self, user_id: int) -> bool:
-        return await remove_subscriber(self._database.connection, user_id)
+        async with self._database.write_lock:
+            return await remove_subscriber(self._database.connection, user_id)
 
     async def toggle(self, user_id: int) -> Subscriber | None:
-        return await toggle_subscription(self._database.connection, user_id)
+        async with self._database.write_lock:
+            return await toggle_subscription(self._database.connection, user_id)

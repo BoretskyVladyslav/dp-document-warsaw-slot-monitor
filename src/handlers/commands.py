@@ -11,6 +11,7 @@ router = Router(name="user_commands")
 
 
 @router.message(CommandStart())
+@router.message(Command("subscribe"))
 async def cmd_start(
     message: Message,
     subscription_service: SubscriptionService,
@@ -27,7 +28,7 @@ async def cmd_start(
     await message.answer(format_start_confirmation(city_name))
 
 
-@router.message(Command("stop"))
+@router.message(Command("stop", "unsubscribe"))
 async def cmd_stop(message: Message, subscription_service: SubscriptionService) -> None:
     user = message.from_user
     if user is None:
