@@ -15,6 +15,7 @@ from playwright.async_api import async_playwright
 
 from src.core.config import get_settings
 from src.services.scraper import (
+    browser_launch_kwargs,
     has_cf_clearance_cookie,
     resolve_repo_path,
     worker_context_kwargs,
@@ -43,19 +44,13 @@ async def _close_browser(browser: object) -> None:
 
 async def _launch_headed_chrome(playwright: object) -> tuple[Browser, str]:
     chromium = playwright.chromium  # type: ignore[attr-defined]
+    launch = browser_launch_kwargs(headless=False)
     try:
-        browser = await chromium.launch(
-            headless=False,
-            channel="chrome",
-            ignore_default_args=["--enable-automation"],
-        )
+        browser = await chromium.launch(channel="chrome", **launch)
         return browser, "chrome"
     except PlaywrightError as exc:
         print(f"system_chrome_unavailable: {exc}", flush=True)
-        browser = await chromium.launch(
-            headless=False,
-            ignore_default_args=["--enable-automation"],
-        )
+        browser = await chromium.launch(**launch)
         return browser, "chromium"
 
 
