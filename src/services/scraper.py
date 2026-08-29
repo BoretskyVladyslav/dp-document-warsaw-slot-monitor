@@ -44,6 +44,8 @@ _CDP_RELOAD_TIMEOUT_MS = 15_000
 _DOM_SIGNAL_TIMEOUT_MS = 15_000
 _DOM_POLL_SECONDS = 0.25
 _DOM_STABILITY_SECONDS = 1.0
+_POST_RELOAD_STABILIZE_SECONDS = 5.0
+_CF_INTERSTITIAL_HOLD_SECONDS = 5.0
 
 _DOM_EVIDENCE_SCRIPT = f"""
 () => {{
@@ -384,7 +386,17 @@ class SlotScraper:
             if is_target_closed_error(exc) or self._page_is_closed(page):
                 raise TargetTabClosedError("target tab closed during soft reload") from exc
             raise
+        await self._stabilize_after_reload(page)
         return await self._wait_for_decisive_evidence(page)
+
+    async def _stabilize_after_reload(self, page: Page) -> None:
+        if _POST_RELOAD_STABILIZE_SECONDS <= 0:
+            return
+        await asyncio.sleep(_POST_RELOAD_STABILIZE_SECONDS)
+        if self._page_is_closed(page):
+            raise TargetTabClosedError(
+                "target tab closed during post-reload stabilization"
+            )
 
     async def _probe_latched_page(self, page: Page) -> SlotCheckResult:
         evidence = await collect_dom_evidence(page)
@@ -414,13 +426,26 @@ class SlotScraper:
         last_result: SlotCheckResult | None = None
         candidate_status: SlotStatus | None = None
         candidate_since: float | None = None
+        challenge_since: float | None = None
         while True:
             evidence = await collect_dom_evidence(page)
             self._raise_if_rate_limited(evidence)
             if has_cloudflare_challenge(evidence):
-                raise CloudflareChallengeError(
-                    "Cloudflare challenge appeared after soft reload"
-                )
+                candidate_status = None
+                candidate_since = None
+                if challenge_since is None:
+                    challenge_since = loop.time()
+                if loop.time() - challenge_since >= _CF_INTERSTITIAL_HOLD_SECONDS:
+                    raise CloudflareChallengeError(
+                        "Cloudflare challenge appeared after soft reload"
+                    )
+                if loop.time() >= deadline:
+                    raise CloudflareChallengeError(
+                        "Cloudflare challenge appeared after soft reload"
+                    )
+                await asyncio.sleep(_DOM_POLL_SECONDS)
+                continue
+            challenge_since = None
             last_result = classify_slot_evidence(evidence)
             if last_result.status is not SlotStatus.UNKNOWN:
                 if candidate_status is not last_result.status:

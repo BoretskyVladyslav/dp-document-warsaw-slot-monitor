@@ -235,10 +235,22 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
         self._poll_patch = patch("src.services.scraper._DOM_POLL_SECONDS", 0)
+        self._stabilize_patch = patch(
+            "src.services.scraper._POST_RELOAD_STABILIZE_SECONDS",
+            0,
+        )
+        self._cf_hold_patch = patch(
+            "src.services.scraper._CF_INTERSTITIAL_HOLD_SECONDS",
+            0,
+        )
         self._stability_patch.start()
         self._poll_patch.start()
+        self._stabilize_patch.start()
+        self._cf_hold_patch.start()
 
     async def asyncTearDown(self) -> None:
+        self._cf_hold_patch.stop()
+        self._stabilize_patch.stop()
         self._poll_patch.stop()
         self._stability_patch.stop()
 
@@ -317,6 +329,25 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             health.failure_code,
             ScraperFailureCode.CLOUDFLARE_CHALLENGE,
         )
+
+    async def test_transient_cloudflare_interstitial_does_not_latch(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.evidence_sequence = [
+            challenge_evidence(),
+            free_evidence(),
+            free_evidence(),
+        ]
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        with patch("src.services.scraper._CF_INTERSTITIAL_HOLD_SECONDS", 60):
+            result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(page.reload_calls, 1)
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.READY)
+        self.assertIsNone(health.failure_code)
 
     async def test_rate_limit_message_raises_typed_failure(self) -> None:
         raw = free_evidence()
