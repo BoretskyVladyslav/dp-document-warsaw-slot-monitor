@@ -5,10 +5,13 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_PATH: /data/monitor.db
+      DATABASE_PATH: /app/data/monitor.db
       HEADLESS: "true"
     volumes:
-      - monitor-data:/data
-
-volumes:
-  monitor-data:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s

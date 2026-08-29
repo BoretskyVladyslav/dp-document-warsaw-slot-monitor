@@ -28,6 +28,7 @@ playwright/.cache/
 *.sqlite
 *.sqlite3
 /data
+data/
 
 # Env / secrets
 .env
