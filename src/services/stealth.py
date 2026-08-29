@@ -46,6 +46,7 @@ STEALTH_INIT_SCRIPT = """
 
 CLOUDFLARE_CLEARED_JS = """
 () => {
+  if (document.readyState === 'loading') return false;
   const title = (document.title || '').toLowerCase();
   if (['just a moment', 'checking your browser', 'attention required'].some((m) => title.includes(m))) {
     return false;

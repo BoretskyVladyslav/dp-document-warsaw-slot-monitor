@@ -41,6 +41,7 @@ class SettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.admin_ids, [])
         self.assertIsNone(settings.proxy_url)
+        self.assertEqual(settings.browser_profile_dir, "data/browser_profile")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     database_path: str = "data/monitor.db"
     service_option: str | None = None
     playwright_timeout_ms: int = Field(default=60_000, ge=5_000, le=180_000)
-    browser_profile_dir: str = "data/browser-profile"
+    browser_profile_dir: str = "data/browser_profile"
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
