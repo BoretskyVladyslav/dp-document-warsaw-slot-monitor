@@ -14,13 +14,11 @@ if "%TARGET_URL%"=="" set "TARGET_URL=https://warszawa.pasport.org.ua/solutions/
 set "CDP_PORT=%~3"
 if "%CDP_PORT%"=="" set "CDP_PORT=9222"
 
-powershell -NoProfile -Command "try { $tabs=Invoke-RestMethod -Uri ('http://127.0.0.1:'+$env:CDP_PORT+'/json/list') -TimeoutSec 1; $target=([uri]$env:TARGET_URL).Host; $hosts=@($tabs | ForEach-Object { try { ([uri]$_.url).Host } catch {} }); if ($hosts -contains $target) { exit 10 }; exit 11 } catch { exit 0 }"
-if errorlevel 11 (
-  echo cdp_port_in_use_by_another_process port=%CDP_PORT%
-  echo Stop that process or pass another port as the third argument and update CDP_URL.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0free_cdp_port.ps1" -Port %CDP_PORT%
+if errorlevel 1 (
+  echo failed_to_free_cdp_port port=%CDP_PORT%
   exit /b 1
 )
-if errorlevel 10 goto cdp_ready
 
 echo Starting dedicated Chrome with remote debugging on port %CDP_PORT%
 echo chrome="%CHROME%"
@@ -33,7 +31,6 @@ if errorlevel 1 (
   echo cdp_target_tab_not_visible
   exit /b 1
 )
-:cdp_ready
 echo CDP_URL=http://127.0.0.1:%CDP_PORT%
 echo Complete any Cloudflare challenge in the opened target tab before starting the bot.
 endlocal

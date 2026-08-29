@@ -70,7 +70,7 @@ The script:
 4. opens the target queue URL;
 5. verifies that the CDP endpoint exposes a tab on the configured target host.
 
-If another process already owns port `9222`, the script fails instead of attaching the bot to the wrong browser. Stop that process or choose another port and set the same value in `.env`:
+If another non-protected process owns the selected port, the script force-stops it, waits until the listener disappears, and prints `Freed port 9222 from previous process`. It then starts the dedicated Chrome instance. A different port can still be selected explicitly:
 
 ```powershell
 scripts\start_chrome_cdp.bat "https://warszawa.pasport.org.ua/solutions/e-queue" 9223
