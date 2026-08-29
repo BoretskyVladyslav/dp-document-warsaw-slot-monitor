@@ -74,7 +74,7 @@ CHROME_CLIENT_HINTS: dict[str, str] = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7,pl;q=0.6",
     "Upgrade-Insecure-Requests": "1",
-    "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "sec-ch-ua": '"Google Chrome";v="151", "Chromium";v="151", "Not A(Brand";v="24"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "Sec-Fetch-Dest": "document",

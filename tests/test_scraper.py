@@ -7,9 +7,11 @@ from pathlib import Path
 
 from src.core.config import Settings
 from src.services.scraper import (
+    SlotScraper,
     chrome_launch_args,
     has_cf_clearance_cookie,
     is_target_closed_error,
+    normalize_cdp_url,
     resolve_repo_path,
     worker_context_kwargs,
 )
@@ -79,6 +81,88 @@ class ScraperHelperTests(unittest.TestCase):
         self.assertIn("--no-sandbox", args)
         self.assertIn("--disable-dev-shm-usage", args)
         self.assertNotIn("--disable-infobars", args)
+
+
+class FakeBrowser:
+    def __init__(self) -> None:
+        self.closed = False
+        self._connected = True
+        self.contexts: list[object] = []
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def close(self) -> None:
+        self.closed = True
+        self._connected = False
+
+
+class CdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_normalize_cdp_url(self) -> None:
+        self.assertIsNone(normalize_cdp_url(None))
+        self.assertIsNone(normalize_cdp_url(""))
+        self.assertIsNone(normalize_cdp_url("  "))
+        self.assertEqual(normalize_cdp_url(" http://localhost:9222 "), "http://localhost:9222")
+
+    async def test_stop_does_not_close_cdp_browser(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            cdp_url="http://localhost:9222",
+            _env_file=None,
+        )
+        scraper = SlotScraper(settings)
+        browser = FakeBrowser()
+        scraper._browser = browser  # type: ignore[assignment]
+        scraper._owns_browser = False
+        scraper._cdp_attached = True
+        await scraper.stop()
+        self.assertFalse(browser.closed)
+        self.assertIsNone(scraper._browser)
+        self.assertFalse(scraper._cdp_attached)
+
+    async def test_stop_closes_owned_browser(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            _env_file=None,
+        )
+        scraper = SlotScraper(settings)
+        browser = FakeBrowser()
+        scraper._browser = browser  # type: ignore[assignment]
+        scraper._owns_browser = True
+        scraper._cdp_attached = False
+        await scraper.stop()
+        self.assertTrue(browser.closed)
+        self.assertIsNone(scraper._browser)
+
+    async def test_cdp_open_page_does_not_close_user_context(self) -> None:
+        class Ctx:
+            def __init__(self) -> None:
+                self.pages: list[object] = ["existing-tab"]
+
+            async def new_page(self) -> object:
+                page = object()
+                self.pages.append(page)
+                return page
+
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            cdp_url="http://localhost:9222",
+            _env_file=None,
+        )
+        scraper = SlotScraper(settings)
+        context = Ctx()
+        browser = FakeBrowser()
+        browser.contexts = [context]
+        scraper._browser = browser  # type: ignore[assignment]
+        scraper._cdp_attached = True
+        opened_context, _page, close_page, close_context = await scraper._open_worker_page()
+        self.assertIs(opened_context, context)
+        self.assertTrue(close_page)
+        self.assertFalse(close_context)
+        self.assertEqual(len(context.pages), 2)
 
 
 if __name__ == "__main__":

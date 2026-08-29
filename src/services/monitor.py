@@ -44,10 +44,19 @@ class SlotMonitor:
         if state is not None:
             self._cached_state = state
 
+    async def run_once(self) -> SlotCheckResult:
+        await self._tick()
+        assert self._last_result is not None
+        return self._last_result
+
     async def run(self, stop: asyncio.Event) -> None:
         try:
             while not stop.is_set():
                 await self._tick()
+                if self._settings.check_once:
+                    logger.info("check_once_complete")
+                    stop.set()
+                    return
                 delay = self._settings.check_interval_seconds + random.uniform(0, 12)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=delay)

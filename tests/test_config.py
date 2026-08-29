@@ -44,6 +44,26 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.admin_ids, [])
         self.assertIsNone(settings.proxy_url)
         self.assertEqual(settings.storage_state_path, "data/storage_state.json")
+        self.assertIsNone(settings.cdp_url)
+        self.assertFalse(settings.check_once)
+
+    def test_empty_cdp_url_becomes_none(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            cdp_url="",
+            _env_file=None,
+        )
+        self.assertIsNone(settings.cdp_url)
+
+    def test_cdp_url_is_kept(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            cdp_url="http://localhost:9222",
+            _env_file=None,
+        )
+        self.assertEqual(settings.cdp_url, "http://localhost:9222")
 
 
 if __name__ == "__main__":

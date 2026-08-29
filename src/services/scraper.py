@@ -59,6 +59,13 @@ def has_cf_clearance_cookie(cookies: list[dict[str, Any]]) -> bool:
     return any(str(item.get("name", "")) == "cf_clearance" for item in cookies)
 
 
+def normalize_cdp_url(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    return value or None
+
+
 def browser_launch_kwargs(*, headless: bool) -> dict[str, Any]:
     return {
         "headless": headless,
@@ -98,6 +105,8 @@ class SlotScraper:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._browser_channel: str = "chromium"
+        self._cdp_attached: bool = False
+        self._owns_browser: bool = True
 
     async def start(self) -> None:
         if self._browser is not None and self._browser.is_connected():
@@ -105,14 +114,21 @@ class SlotScraper:
         if self._browser is not None:
             await self._reset()
         self._playwright = await async_playwright().start()
-        launch = browser_launch_kwargs(headless=self._settings.headless)
-        try:
-            self._browser = await self._playwright.chromium.launch(channel="chrome", **launch)
-            self._browser_channel = "chrome"
-        except PlaywrightError as exc:
-            logger.warning("system_chrome_unavailable", extra={"error": str(exc)})
-            self._browser = await self._playwright.chromium.launch(**launch)
-            self._browser_channel = "chromium"
+        cdp_url = normalize_cdp_url(self._settings.cdp_url)
+        if cdp_url is not None:
+            try:
+                self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
+                self._cdp_attached = True
+                self._owns_browser = False
+                self._browser_channel = "cdp"
+            except (PlaywrightError, OSError) as exc:
+                logger.warning(
+                    "cdp_connect_failed",
+                    extra={"cdp_url": cdp_url, "error": str(exc)},
+                )
+                await self._launch_owned_browser()
+        else:
+            await self._launch_owned_browser()
         storage = resolve_repo_path(self._settings.storage_state_path)
         logger.info(
             "scraper_started",
@@ -120,18 +136,36 @@ class SlotScraper:
                 "city": self._settings.city_name,
                 "headless": self._settings.headless,
                 "channel": self._browser_channel,
+                "cdp_attached": self._cdp_attached,
                 "storage_state": str(storage),
                 "storage_state_exists": is_usable_storage_state(storage),
             },
         )
 
+    async def _launch_owned_browser(self) -> None:
+        assert self._playwright is not None
+        self._cdp_attached = False
+        self._owns_browser = True
+        launch = browser_launch_kwargs(headless=self._settings.headless)
+        try:
+            self._browser = await self._playwright.chromium.launch(channel="chrome", **launch)
+            self._browser_channel = "chrome"
+        except PlaywrightError as extra:
+            logger.warning("system_chrome_unavailable", extra={"error": str(extra)})
+            self._browser = await self._playwright.chromium.launch(**launch)
+            self._browser_channel = "chromium"
+
     async def stop(self) -> None:
-        await self._close_browser()
+        if self._owns_browser:
+            await self._close_browser()
+        else:
+            self._browser = None
+            self._cdp_attached = False
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
-            except PlaywrightError as exc:
-                logger.warning("playwright_stop_failed", extra={"error": str(exc)})
+            except PlaywrightError as extra:
+                logger.warning("playwright_stop_failed", extra={"error": str(extra)})
             self._playwright = None
 
     async def check_availability(self) -> SlotCheckResult:
@@ -139,16 +173,12 @@ class SlotScraper:
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             context: BrowserContext | None = None
             page: Page | None = None
+            close_page = False
+            close_context = False
             try:
                 await self.start()
                 assert self._browser is not None
-                storage = resolve_repo_path(self._settings.storage_state_path)
-                context = await self._browser.new_context(
-                    **worker_context_kwargs(self._settings, storage)
-                )
-                await context.add_init_script(STEALTH_INIT_SCRIPT)
-                await stealth_async(context)
-                page = await context.new_page()
+                context, page, close_page, close_context = await self._open_worker_page()
                 return await self._inspect_page(page)
             except SessionExpiredException as exc:
                 logger.warning(
@@ -161,42 +191,45 @@ class SlotScraper:
                     error="session_expired",
                     details=str(exc),
                 )
-            except (NetworkTimeoutError, PlaywrightTimeoutError) as exc:
+            except (NetworkTimeoutError, PlaywrightTimeoutError) as extra:
                 logger.warning(
                     "scraper_timeout",
                     extra={
                         "city": self._settings.city_name,
                         "attempt": attempt,
-                        "error": str(exc),
+                        "error": str(extra),
                     },
                 )
                 last_unknown = SlotCheckResult(
                     status=SlotStatus.UNKNOWN,
                     checked_at=datetime.now(timezone.utc),
                     error="timeout",
-                    details=str(exc),
+                    details=str(extra),
                 )
-            except (ScraperError, PlaywrightError, OSError) as exc:
-                closed = is_target_closed_error(exc)
+            except (ScraperError, PlaywrightError, OSError) as extra:
+                closed = is_target_closed_error(extra)
                 log = logger.warning if closed else logger.exception
                 log(
                     "browser_context_closed" if closed else "scraper_failed",
                     extra={
                         "city": self._settings.city_name,
                         "attempt": attempt,
-                        "error": str(exc),
+                        "error": str(extra),
                     },
                 )
                 last_unknown = SlotCheckResult(
                     status=SlotStatus.UNKNOWN,
                     checked_at=datetime.now(timezone.utc),
                     error="scraper_error",
-                    details=str(exc),
+                    details=str(extra),
                 )
-                await self._reset()
+                if self._owns_browser or self._browser is None or not self._browser.is_connected():
+                    await self._reset()
             finally:
-                await self._close_page(page)
-                await self._close_context(context)
+                if close_page:
+                    await self._close_page(page)
+                if close_context:
+                    await self._close_context(context)
             if attempt < _MAX_ATTEMPTS:
                 delay = 3.0 + random.uniform(0.4, 1.6)
                 logger.info(
@@ -210,6 +243,25 @@ class SlotScraper:
             error="scraper_error",
             details="exhausted scraper attempts",
         )
+
+    async def _open_worker_page(self) -> tuple[BrowserContext, Page, bool, bool]:
+        assert self._browser is not None
+        if self._cdp_attached:
+            if not self._browser.contexts:
+                raise ScraperError("CDP Chrome has no open context")
+            context = self._browser.contexts[0]
+            page = await context.new_page()
+            logger.info(
+                "cdp_tab_opened",
+                extra={"city": self._settings.city_name, "open_tabs": len(context.pages)},
+            )
+            return context, page, True, False
+        storage = resolve_repo_path(self._settings.storage_state_path)
+        context = await self._browser.new_context(**worker_context_kwargs(self._settings, storage))
+        await context.add_init_script(STEALTH_INIT_SCRIPT)
+        await stealth_async(context)
+        page = await context.new_page()
+        return context, page, True, True
 
     async def _inspect_page(self, page: Page) -> SlotCheckResult:
         payloads: list[Any] = []
@@ -228,7 +280,8 @@ class SlotScraper:
 
         page.on("response", _capture_response)
         timeout = self._settings.playwright_timeout_ms
-        await stealth_async(page)
+        if not self._cdp_attached:
+            await stealth_async(page)
         await _human_pause(0.3, 1.2)
         try:
             await page.goto(
@@ -236,8 +289,8 @@ class SlotScraper:
                 wait_until="domcontentloaded",
                 timeout=timeout,
             )
-        except PlaywrightTimeoutError as exc:
-            raise NetworkTimeoutError(str(exc)) from exc
+        except PlaywrightTimeoutError as extra:
+            raise NetworkTimeoutError(str(extra)) from extra
 
         await _human_pause(0.5, 1.2)
         title = await page.title()
@@ -283,10 +336,10 @@ class SlotScraper:
             if await text_match.count() > 0:
                 await text_match.click()
                 await _human_pause()
-        except PlaywrightError as exc:
+        except PlaywrightError as extra:
             logger.warning(
                 "service_option_not_selected",
-                extra={"label": label, "error": str(exc)},
+                extra={"label": label, "error": str(extra)},
             )
 
     async def _close_page(self, page: Page | None) -> None:
@@ -295,16 +348,16 @@ class SlotScraper:
         try:
             if not page.is_closed():
                 await page.close()
-        except PlaywrightError as exc:
-            logger.warning("page_close_failed", extra={"error": str(exc)})
+        except PlaywrightError as extra:
+            logger.warning("page_close_failed", extra={"error": str(extra)})
 
     async def _close_context(self, context: BrowserContext | None) -> None:
         if context is None:
             return
         try:
             await context.close()
-        except PlaywrightError as exc:
-            logger.warning("context_close_failed", extra={"error": str(exc)})
+        except PlaywrightError as extra:
+            logger.warning("context_close_failed", extra={"error": str(extra)})
 
     async def _close_browser(self) -> None:
         if self._browser is None:
@@ -312,8 +365,8 @@ class SlotScraper:
         try:
             if self._browser.is_connected():
                 await self._browser.close()
-        except PlaywrightError as exc:
-            logger.warning("browser_close_failed", extra={"error": str(exc)})
+        except PlaywrightError as extra:
+            logger.warning("browser_close_failed", extra={"error": str(extra)})
         self._browser = None
 
     async def _reset(self) -> None:

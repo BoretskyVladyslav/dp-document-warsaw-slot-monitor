@@ -23,9 +23,11 @@ class Settings(BaseSettings):
     service_option: str | None = None
     playwright_timeout_ms: int = Field(default=60_000, ge=5_000, le=180_000)
     storage_state_path: str = "data/storage_state.json"
+    cdp_url: str | None = None
+    check_once: bool = False
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
     )
 
     @field_validator("admin_ids", mode="before")
@@ -39,7 +41,7 @@ class Settings(BaseSettings):
             return [value]
         return value
 
-    @field_validator("proxy_url", "service_option", mode="before")
+    @field_validator("proxy_url", "service_option", "cdp_url", mode="before")
     @classmethod
     def empty_str_to_none(cls, value: object) -> object:
         if value == "":

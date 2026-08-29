@@ -60,6 +60,9 @@ async def _amain(settings: Settings) -> None:
             started_at=started_at,
         )
         await monitor.restore_state()
+        if settings.check_once:
+            await monitor.run_once()
+            return
         dp = Dispatcher()
         dp["subscription_service"] = SubscriptionService(database)
         dp["status_service"] = StatusService(monitor)
@@ -96,6 +99,8 @@ async def main() -> None:
             "city": settings.city_name,
             "interval": settings.check_interval_seconds,
             "headless": settings.headless,
+            "cdp_url": settings.cdp_url,
+            "check_once": settings.check_once,
         },
     )
     await _amain(settings)
