@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,12 +30,17 @@ _TURNSTILE_IFRAME_SELECTOR = (
     ".cf-turnstile iframe, "
     "#challenge-stage iframe"
 )
-_LAUNCH_ARGS: list[str] = [
+_CONTAINER_HEADLESS_ARGS: list[str] = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-infobars",
-    "--lang=uk-UA,uk,en-US,en",
 ]
+_LANG_ARG = "--lang=uk-UA,uk"
+
+
+def chrome_launch_args(*, headless: bool) -> list[str]:
+    if sys.platform == "win32" or not headless:
+        return [_LANG_ARG]
+    return [*_CONTAINER_HEADLESS_ARGS, _LANG_ARG]
 
 
 def is_turnstile_frame_url(url: str) -> bool:
@@ -72,7 +78,7 @@ def persistent_context_kwargs(settings: Settings, user_data_dir: str, *, headles
     kwargs: dict[str, Any] = {
         "user_data_dir": user_data_dir,
         "headless": headless,
-        "args": list(_LAUNCH_ARGS),
+        "args": chrome_launch_args(headless=headless),
         "ignore_default_args": ["--enable-automation"],
         "user_agent": settings.user_agent,
         "locale": "uk-UA",

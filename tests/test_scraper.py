@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sys
 import unittest
 
 from src.core.config import Settings
 from src.services.scraper import (
+    chrome_launch_args,
     has_cf_clearance_cookie,
     is_target_closed_error,
     is_turnstile_frame_url,
@@ -53,17 +55,24 @@ class ScraperHelperTests(unittest.TestCase):
         kwargs = persistent_context_kwargs(settings, "data/browser_profile", headless=False)
         self.assertEqual(kwargs["ignore_default_args"], ["--enable-automation"])
         self.assertTrue(kwargs["no_viewport"])
-        self.assertEqual(
-            kwargs["args"],
-            [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-infobars",
-                "--lang=uk-UA,uk,en-US,en",
-            ],
-        )
-        self.assertNotIn("--disable-setuid-sandbox", kwargs["args"])
-        self.assertNotIn("--disable-blink-features=AutomationControlled", kwargs["args"])
+        self.assertEqual(kwargs["args"], ["--lang=uk-UA,uk"])
+        banned = {
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-infobars",
+            "--disable-blink-features=AutomationControlled",
+        }
+        self.assertTrue(banned.isdisjoint(kwargs["args"]))
+
+    def test_linux_headless_keeps_container_sandbox_flags(self) -> None:
+        args = chrome_launch_args(headless=True)
+        if sys.platform == "win32":
+            self.assertEqual(args, ["--lang=uk-UA,uk"])
+            return
+        self.assertIn("--no-sandbox", args)
+        self.assertIn("--disable-dev-shm-usage", args)
+        self.assertNotIn("--disable-infobars", args)
 
 
 if __name__ == "__main__":

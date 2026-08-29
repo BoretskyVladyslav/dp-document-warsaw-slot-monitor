@@ -44,7 +44,14 @@ async def main() -> int:
         except PlaywrightTimeoutError as exc:
             print(f"navigation_timeout: {exc}", flush=True)
         print(PROMPT, flush=True)
-        await asyncio.to_thread(input)
+        try:
+            await asyncio.to_thread(input)
+        except EOFError:
+            print("cancelled: stdin closed", flush=True)
+            return 130
+        except KeyboardInterrupt:
+            print("cancelled", flush=True)
+            return 130
 
         title = await page.title()
         html = await page.content()
@@ -78,4 +85,7 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    try:
+        raise SystemExit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
