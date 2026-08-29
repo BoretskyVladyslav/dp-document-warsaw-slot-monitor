@@ -1,5 +1,6 @@
 aiogram>=3.13,<4
 playwright>=1.49
+playwright-stealth>=2,<3
 aiosqlite>=0.20
 pydantic-settings>=2.6
 python-dotenv>=1.0

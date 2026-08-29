@@ -1,3 +1,16 @@
+from playwright.async_api import BrowserContext, Page
+from playwright_stealth import Stealth
+
+_STEALTH = Stealth(
+    navigator_languages_override=("uk-UA", "uk", "en-US", "en"),
+    navigator_platform_override="Win32",
+)
+
+
+async def stealth_async(page: Page | BrowserContext) -> None:
+    await _STEALTH.apply_stealth_async(page)
+
+
 STEALTH_INIT_SCRIPT = """
 (() => {
   Object.defineProperty(navigator, 'webdriver', { get: () => undefined });

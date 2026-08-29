@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import unittest
 
+from src.core.config import Settings
 from src.services.scraper import (
     has_cf_clearance_cookie,
     is_target_closed_error,
     is_turnstile_frame_url,
+    persistent_context_kwargs,
     resolve_browser_profile_dir,
 )
 
@@ -42,6 +44,26 @@ class ScraperHelperTests(unittest.TestCase):
     def test_cf_clearance_cookie_detection(self) -> None:
         self.assertTrue(has_cf_clearance_cookie([{"name": "cf_clearance", "value": "x"}]))
         self.assertFalse(has_cf_clearance_cookie([{"name": "__cf_bm", "value": "x"}]))
+
+    def test_headed_launch_args_are_clean(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+        )
+        kwargs = persistent_context_kwargs(settings, "data/browser_profile", headless=False)
+        self.assertEqual(kwargs["ignore_default_args"], ["--enable-automation"])
+        self.assertTrue(kwargs["no_viewport"])
+        self.assertEqual(
+            kwargs["args"],
+            [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--lang=uk-UA,uk,en-US,en",
+            ],
+        )
+        self.assertNotIn("--disable-setuid-sandbox", kwargs["args"])
+        self.assertNotIn("--disable-blink-features=AutomationControlled", kwargs["args"])
 
 
 if __name__ == "__main__":

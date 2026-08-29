@@ -18,6 +18,7 @@ from src.services.scraper import (
     resolve_browser_profile_dir,
 )
 from src.services.slot_parser import is_cloudflare_challenge, parse_slot_page
+from src.services.stealth import stealth_async
 
 PROMPT = (
     "Please complete the Cloudflare/Turnstile check in the opened browser window... "
@@ -37,6 +38,7 @@ async def main() -> int:
         print(f"profile={profile}", flush=True)
         print(f"channel={channel}", flush=True)
         print(f"url={settings.target_url}", flush=True)
+        await stealth_async(page)
         try:
             await page.goto(str(settings.target_url), wait_until="domcontentloaded", timeout=60_000)
         except PlaywrightTimeoutError as exc:

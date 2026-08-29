@@ -16,7 +16,7 @@ from src.core.config import Settings
 from src.core.exceptions import CloudflareChallengeError, NetworkTimeoutError, ScraperError
 from src.core.models import SlotCheckResult, SlotStatus
 from src.services.slot_parser import dumps_payload, is_cloudflare_challenge, parse_slot_page
-from src.services.stealth import CHROME_CLIENT_HINTS, CLOUDFLARE_CLEARED_JS, STEALTH_INIT_SCRIPT
+from src.services.stealth import CHROME_CLIENT_HINTS, CLOUDFLARE_CLEARED_JS, STEALTH_INIT_SCRIPT, stealth_async
 
 logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -30,13 +30,10 @@ _TURNSTILE_IFRAME_SELECTOR = (
     "#challenge-stage iframe"
 )
 _LAUNCH_ARGS: list[str] = [
-    "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
     "--no-sandbox",
-    "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-infobars",
-    "--window-size=1920,1080",
+    "--lang=uk-UA,uk,en-US,en",
 ]
 
 
@@ -80,12 +77,15 @@ def persistent_context_kwargs(settings: Settings, user_data_dir: str, *, headles
         "user_agent": settings.user_agent,
         "locale": "uk-UA",
         "timezone_id": "Europe/Warsaw",
-        "viewport": {"width": 1920, "height": 1080},
-        "screen": {"width": 1920, "height": 1080},
         "color_scheme": "light",
         "java_script_enabled": True,
         "extra_http_headers": CHROME_CLIENT_HINTS,
     }
+    if headless:
+        kwargs["viewport"] = {"width": 1920, "height": 1080}
+        kwargs["screen"] = {"width": 1920, "height": 1080}
+    else:
+        kwargs["no_viewport"] = True
     if settings.proxy_url:
         kwargs["proxy"] = {"server": settings.proxy_url}
     return kwargs
@@ -112,6 +112,7 @@ async def open_persistent_context(
         context = await playwright.chromium.launch_persistent_context(**context_kwargs)
         channel = "chromium"
     await context.add_init_script(STEALTH_INIT_SCRIPT)
+    await stealth_async(context)
     return playwright, context, channel, profile
 
 
@@ -260,6 +261,7 @@ class SlotScraper:
 
         page.on("response", _capture_response)
         timeout = self._settings.playwright_timeout_ms
+        await stealth_async(page)
         await _human_pause(0.3, 1.2)
         try:
             await page.goto(
