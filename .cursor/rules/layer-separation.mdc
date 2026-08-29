@@ -1,0 +1,21 @@
+---
+description: Keep business logic, database, and Telegram handlers separate
+alwaysApply: true
+---
+
+# Layer separation
+
+- `src/handlers/` — Telegram I/O only: parse updates, call services, format replies. No SQL, no repository imports.
+- `src/services/` — business logic and orchestration. Depends on database abstractions, not on Telegram types.
+- `src/database/` — persistence only (queries, models, migrations). No Telegram, no domain policy.
+
+```python
+# BAD — handler talks to DB
+async def on_status(message: Message) -> None:
+    row = await db.fetch_user(message.from_user.id)
+
+# GOOD — handler → service
+async def on_status(message: Message) -> None:
+    status = await user_service.get_status(message.from_user.id)
+    await message.answer(format_status(status))
+```

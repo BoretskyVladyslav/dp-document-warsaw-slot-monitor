@@ -1,0 +1,12 @@
+# DP Document Warsaw Slot Monitor
+
+## Async Python
+Use asyncio throughout. Public functions must be `async` with type hints. No blocking I/O on the event loop.
+
+## Layer separation
+- src/handlers/ — Telegram I/O only; no database access.
+- src/services/ — business logic; no Telegram types.
+- src/database/ — persistence only; no Telegram or domain policy.
+
+## Exceptions and logging
+Catch specific exceptions; never bare `except` or silent swallow. Structured logging with context (`extra=`); no `print` for ops logs.

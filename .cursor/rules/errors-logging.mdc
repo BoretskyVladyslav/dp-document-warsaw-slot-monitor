@@ -1,0 +1,29 @@
+---
+description: Require clean exception handling and structured logging
+alwaysApply: true
+---
+
+# Exceptions and logging
+
+No bare `except`. Log with structure; do not use `print` for operational logs.
+
+```python
+# BAD
+try:
+    await book_slot(slot_id)
+except Exception:
+    pass
+
+print("booked", slot_id)
+
+# GOOD
+try:
+    await book_slot(slot_id)
+except SlotUnavailableError as exc:
+    logger.warning("slot_unavailable", extra={"slot_id": slot_id, "error": str(exc)})
+    raise
+```
+
+- Catch specific exceptions; re-raise or wrap with a domain error. Never swallow failures silently.
+- Use the stdlib `logging` logger (or a structured wrapper) with `extra=` / bound context (`slot_id`, `user_id`, `request_id`).
+- Include exception info on errors (`logger.exception` or `exc_info=True`).

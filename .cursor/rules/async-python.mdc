@@ -1,0 +1,22 @@
+---
+description: Require asyncio and type hints on all Python code
+alwaysApply: true
+---
+
+# Async Python
+
+All I/O and public APIs are async. Type-hint every public function.
+
+```python
+# BAD
+def fetch_slots():
+    return client.get("/slots")
+
+# GOOD
+async def fetch_slots() -> list[Slot]:
+    return await client.get("/slots")
+```
+
+- Use `async`/`await` and `asyncio` primitives; do not add blocking I/O (`time.sleep`, sync `requests`, sync DB drivers).
+- Annotate parameters and return types on public functions, methods, and module-level coroutines.
+- Run CPU-bound or sync third-party calls via `asyncio.to_thread` (or an equivalent executor), not on the event loop.
