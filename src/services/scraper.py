@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright
 from playwright.async_api import Error as PlaywrightError
@@ -64,6 +65,22 @@ def normalize_cdp_url(raw: str | None) -> str | None:
         return None
     value = raw.strip()
     return value or None
+
+
+def page_matches_target_url(page_url: str, target_url: str) -> bool:
+    page = urlparse(page_url)
+    target = urlparse(target_url)
+    if not page.netloc or page.netloc.lower() != target.netloc.lower():
+        return False
+    page_path = page.path.rstrip("/")
+    target_path = target.path.rstrip("/")
+    return page_path == target_path or page_path.startswith(f"{target_path}/")
+
+
+def _same_host(page_url: str, target_url: str) -> bool:
+    page_host = urlparse(page_url).netloc.lower()
+    target_host = urlparse(target_url).netloc.lower()
+    return bool(page_host) and page_host == target_host
 
 
 def browser_launch_kwargs(*, headless: bool) -> dict[str, Any]:
@@ -247,21 +264,41 @@ class SlotScraper:
     async def _open_worker_page(self) -> tuple[BrowserContext, Page, bool, bool]:
         assert self._browser is not None
         if self._cdp_attached:
-            if not self._browser.contexts:
-                raise ScraperError("CDP Chrome has no open context")
-            context = self._browser.contexts[0]
-            page = await context.new_page()
-            logger.info(
-                "cdp_tab_opened",
-                extra={"city": self._settings.city_name, "open_tabs": len(context.pages)},
-            )
-            return context, page, True, False
+            return await self._open_cdp_page()
         storage = resolve_repo_path(self._settings.storage_state_path)
         context = await self._browser.new_context(**worker_context_kwargs(self._settings, storage))
         await context.add_init_script(STEALTH_INIT_SCRIPT)
         await stealth_async(context)
         page = await context.new_page()
         return context, page, True, True
+
+    async def _open_cdp_page(self) -> tuple[BrowserContext, Page, bool, bool]:
+        assert self._browser is not None
+        if not self._browser.contexts:
+            raise ScraperError("CDP Chrome has no open context")
+        context = self._browser.contexts[0]
+        target = str(self._settings.target_url)
+        open_pages = [page for page in context.pages if not page.is_closed()]
+        matched = next((page for page in open_pages if page_matches_target_url(page.url, target)), None)
+        if matched is not None:
+            logger.info(
+                "cdp_reusing_target_tab",
+                extra={"city": self._settings.city_name, "open_tabs": len(open_pages)},
+            )
+            return context, matched, False, False
+        same_host = next((page for page in open_pages if _same_host(page.url, target)), None)
+        if same_host is not None:
+            logger.info(
+                "cdp_reusing_same_host_tab",
+                extra={"city": self._settings.city_name, "open_tabs": len(open_pages)},
+            )
+            return context, same_host, False, False
+        page = await context.new_page()
+        logger.info(
+            "cdp_tab_opened",
+            extra={"city": self._settings.city_name, "open_tabs": len(context.pages)},
+        )
+        return context, page, True, False
 
     async def _inspect_page(self, page: Page) -> SlotCheckResult:
         payloads: list[Any] = []

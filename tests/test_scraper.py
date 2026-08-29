@@ -12,6 +12,7 @@ from src.services.scraper import (
     has_cf_clearance_cookie,
     is_target_closed_error,
     normalize_cdp_url,
+    page_matches_target_url,
     resolve_repo_path,
     worker_context_kwargs,
 )
@@ -83,6 +84,26 @@ class ScraperHelperTests(unittest.TestCase):
         self.assertNotIn("--disable-infobars", args)
 
 
+class FakePage:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def is_closed(self) -> bool:
+        return False
+
+
+class FakeContext:
+    def __init__(self, pages: list[FakePage] | None = None) -> None:
+        self.pages: list[FakePage] = list(pages or [])
+        self.new_page_calls = 0
+
+    async def new_page(self) -> FakePage:
+        self.new_page_calls += 1
+        page = FakePage("about:blank")
+        self.pages.append(page)
+        return page
+
+
 class FakeBrowser:
     def __init__(self) -> None:
         self.closed = False
@@ -102,7 +123,14 @@ class CdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(normalize_cdp_url(None))
         self.assertIsNone(normalize_cdp_url(""))
         self.assertIsNone(normalize_cdp_url("  "))
-        self.assertEqual(normalize_cdp_url(" http://localhost:9222 "), "http://localhost:9222")
+        self.assertEqual(normalize_cdp_url(" http://127.0.0.1:9222 "), "http://127.0.0.1:9222")
+
+    def test_page_matches_target_url(self) -> None:
+        target = "https://warszawa.pasport.org.ua/solutions/e-queue"
+        self.assertTrue(page_matches_target_url(f"{target}?x=1", target))
+        self.assertTrue(page_matches_target_url(f"{target}/", target))
+        self.assertFalse(page_matches_target_url("https://example.com/solutions/e-queue", target))
+        self.assertFalse(page_matches_target_url("about:blank", target))
 
     async def test_stop_does_not_close_cdp_browser(self) -> None:
         settings = Settings(
@@ -136,24 +164,37 @@ class CdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(browser.closed)
         self.assertIsNone(scraper._browser)
 
-    async def test_cdp_open_page_does_not_close_user_context(self) -> None:
-        class Ctx:
-            def __init__(self) -> None:
-                self.pages: list[object] = ["existing-tab"]
-
-            async def new_page(self) -> object:
-                page = object()
-                self.pages.append(page)
-                return page
-
+    async def test_cdp_reuses_tab_already_on_target(self) -> None:
+        target = "https://warszawa.pasport.org.ua/solutions/e-queue"
         settings = Settings(
             bot_token="1234567890:TESTTOKENVALUE",
-            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
-            cdp_url="http://localhost:9222",
+            target_url=target,
+            cdp_url="http://127.0.0.1:9222",
             _env_file=None,
         )
         scraper = SlotScraper(settings)
-        context = Ctx()
+        keep = FakePage(target)
+        context = FakeContext([FakePage("https://example.com/"), keep])
+        browser = FakeBrowser()
+        browser.contexts = [context]
+        scraper._browser = browser  # type: ignore[assignment]
+        scraper._cdp_attached = True
+        opened_context, page, close_page, close_context = await scraper._open_worker_page()
+        self.assertIs(opened_context, context)
+        self.assertIs(page, keep)
+        self.assertFalse(close_page)
+        self.assertFalse(close_context)
+        self.assertEqual(context.new_page_calls, 0)
+
+    async def test_cdp_open_page_does_not_close_user_context(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            cdp_url="http://127.0.0.1:9222",
+            _env_file=None,
+        )
+        scraper = SlotScraper(settings)
+        context = FakeContext([FakePage("https://example.com/")])
         browser = FakeBrowser()
         browser.contexts = [context]
         scraper._browser = browser  # type: ignore[assignment]
@@ -162,6 +203,7 @@ class CdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(opened_context, context)
         self.assertTrue(close_page)
         self.assertFalse(close_context)
+        self.assertEqual(context.new_page_calls, 1)
         self.assertEqual(len(context.pages), 2)
 
 

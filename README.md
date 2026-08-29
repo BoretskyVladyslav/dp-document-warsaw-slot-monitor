@@ -27,7 +27,7 @@ On Linux/macOS use `cp .env.example .env`. Edit `.env` before the first run.
 | `CITY_NAME` | no | `Warsaw` | Label used in alerts and `/status` |
 | `HEADLESS` | no | `true` | `false` only for local debugging |
 | `STORAGE_STATE_PATH` | no | `data/storage_state.json` | Cookies from `scripts/solve_session.py` |
-| `CDP_URL` | no | unset | Playwright `connect_over_cdp` endpoint, e.g. `http://localhost:9222` |
+| `CDP_URL` | no | unset | Playwright `connect_over_cdp` endpoint, e.g. `http://127.0.0.1:9222` |
 | `CHECK_ONCE` | no | `false` | `true` runs one check and exits |
 | `DATABASE_PATH` | no | `data/monitor.db` | SQLite file; Compose sets `/app/data/monitor.db` |
 | `SERVICE_OPTION` | no | unset | Dropdown option text to click after load |
@@ -53,9 +53,10 @@ Linux/macOS activate with `source .venv/bin/activate`. SQLite is created at `dat
 To attach to a real Chrome session (same TLS/IP/cookies as your desktop):
 
 1. Close all Chrome windows.
-2. Run `scripts\start_chrome_debug.bat` (optional argument: a custom `--user-data-dir`).
-3. Set `CDP_URL=http://localhost:9222` in `.env`.
-4. Start the bot. The worker opens a new tab, scrapes `TARGET_URL`, and closes only that tab.
+2. Run `scripts\start_chrome_cdp.bat` (or `scripts\start_chrome_debug.bat` with an optional custom profile dir).
+3. Set `CDP_URL=http://127.0.0.1:9222` in `.env`.
+4. Open `TARGET_URL` in that Chrome window (or leave it; the worker will reuse a matching tab or same-host tab, otherwise open a new tab).
+5. Start the bot. The worker does not close Chrome or your existing tabs.
 
 If `CDP_URL` is empty or the connect fails, the worker launches Chrome/Chromium with `storage_state` as before.
 
