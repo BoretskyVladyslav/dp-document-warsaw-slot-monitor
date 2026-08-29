@@ -42,10 +42,12 @@ logger = logging.getLogger(__name__)
 _CDP_CONNECT_TIMEOUT_MS = 15_000
 _CDP_RELOAD_TIMEOUT_MS = 15_000
 _DOM_SIGNAL_TIMEOUT_MS = 15_000
+_QUEUE_UI_WAIT_MS = 20_000
+_CONTEXT_RETRY_SECONDS = 3.0
 _DOM_POLL_SECONDS = 0.25
 _DOM_STABILITY_SECONDS = 1.0
-_POST_RELOAD_STABILIZE_SECONDS = 5.0
 _CF_INTERSTITIAL_HOLD_SECONDS = 5.0
+_QUEUE_UI_SELECTOR = f"text={OCCUPIED_HEADING}, input[type='tel']"
 
 _DOM_EVIDENCE_SCRIPT = f"""
 () => {{
@@ -118,6 +120,14 @@ def is_target_closed_error(exc: BaseException) -> bool:
     )
 
 
+def is_execution_context_destroyed(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "execution context was destroyed" in message
+        or "most likely because of a navigation" in message
+    )
+
+
 def normalize_cdp_url(raw: str | None) -> str | None:
     if raw is None:
         return None
@@ -174,7 +184,17 @@ def cdp_tab_matches(page_url: str, target_url: str) -> bool:
 
 
 async def collect_dom_evidence(page: Page) -> SlotPageEvidence:
-    raw = await page.evaluate(_DOM_EVIDENCE_SCRIPT)
+    try:
+        raw = await page.evaluate(_DOM_EVIDENCE_SCRIPT)
+    except PlaywrightError as exc:
+        if not is_execution_context_destroyed(exc):
+            raise
+        logger.warning(
+            "dom_evaluate_context_destroyed",
+            extra={"error": str(exc)},
+        )
+        await asyncio.sleep(_CONTEXT_RETRY_SECONDS)
+        raw = await page.evaluate(_DOM_EVIDENCE_SCRIPT)
     if not isinstance(raw, dict):
         raise PlaywrightError("DOM evidence script returned a non-object value")
     return SlotPageEvidence(
@@ -386,17 +406,59 @@ class SlotScraper:
             if is_target_closed_error(exc) or self._page_is_closed(page):
                 raise TargetTabClosedError("target tab closed during soft reload") from exc
             raise
-        await self._stabilize_after_reload(page)
+        await self._wait_for_queue_ui(page)
         return await self._wait_for_decisive_evidence(page)
 
-    async def _stabilize_after_reload(self, page: Page) -> None:
-        if _POST_RELOAD_STABILIZE_SECONDS <= 0:
-            return
-        await asyncio.sleep(_POST_RELOAD_STABILIZE_SECONDS)
-        if self._page_is_closed(page):
-            raise TargetTabClosedError(
-                "target tab closed during post-reload stabilization"
+    async def _wait_for_queue_ui(self, page: Page) -> None:
+        try:
+            await page.wait_for_selector(
+                _QUEUE_UI_SELECTOR,
+                timeout=_QUEUE_UI_WAIT_MS,
+                state="visible",
             )
+        except PlaywrightTimeoutError:
+            logger.info(
+                "queue_ui_wait_timeout",
+                extra={"city": self._settings.city_name, "timeout_ms": _QUEUE_UI_WAIT_MS},
+            )
+        except PlaywrightError as exc:
+            if is_target_closed_error(exc) or self._page_is_closed(page):
+                raise TargetTabClosedError(
+                    "target tab closed while waiting for queue UI"
+                ) from exc
+            if not is_execution_context_destroyed(exc):
+                raise
+            logger.warning(
+                "queue_ui_wait_context_destroyed",
+                extra={"city": self._settings.city_name, "error": str(exc)},
+            )
+            await asyncio.sleep(_CONTEXT_RETRY_SECONDS)
+            if self._page_is_closed(page):
+                raise TargetTabClosedError(
+                    "target tab closed while waiting for queue UI"
+                ) from exc
+            try:
+                await page.wait_for_selector(
+                    _QUEUE_UI_SELECTOR,
+                    timeout=_QUEUE_UI_WAIT_MS,
+                    state="visible",
+                )
+            except PlaywrightTimeoutError:
+                logger.info(
+                    "queue_ui_wait_timeout",
+                    extra={
+                        "city": self._settings.city_name,
+                        "timeout_ms": _QUEUE_UI_WAIT_MS,
+                    },
+                )
+            except PlaywrightError as retry_exc:
+                if is_target_closed_error(retry_exc) or self._page_is_closed(page):
+                    raise TargetTabClosedError(
+                        "target tab closed while waiting for queue UI"
+                    ) from retry_exc
+                if is_execution_context_destroyed(retry_exc):
+                    return
+                raise
 
     async def _probe_latched_page(self, page: Page) -> SlotCheckResult:
         evidence = await collect_dom_evidence(page)

@@ -16,8 +16,11 @@ from src.core.exceptions import (
 from src.core.models import ScraperFailureCode, ScraperHealthStatus, SlotStatus
 from src.services.scraper import (
     SlotScraper,
+    _QUEUE_UI_SELECTOR,
+    _QUEUE_UI_WAIT_MS,
     cdp_tab_matches,
     collect_dom_evidence,
+    is_execution_context_destroyed,
     is_target_closed_error,
     normalize_cdp_url,
     page_matches_challenge_url,
@@ -75,6 +78,14 @@ class ScraperHelperTests(unittest.TestCase):
             )
         )
         self.assertFalse(is_target_closed_error(RuntimeError("connection reset")))
+        self.assertTrue(
+            is_execution_context_destroyed(
+                PlaywrightError(
+                    "Execution context was destroyed, most likely because of a navigation"
+                )
+            )
+        )
+        self.assertFalse(is_execution_context_destroyed(RuntimeError("connection reset")))
 
     def test_normalize_cdp_url(self) -> None:
         self.assertIsNone(normalize_cdp_url(None))
@@ -148,6 +159,11 @@ class FakePage:
         self.reload_timeout: int | None = None
         self.reload_error: BaseException | None = None
         self.evidence_sequence: list[dict[str, object]] = []
+        self.evaluate_errors: list[BaseException] = []
+        self.wait_for_selector_calls = 0
+        self.wait_for_selector_timeout: int | None = None
+        self.wait_for_selector_selector: str | None = None
+        self.wait_for_selector_error: BaseException | None = None
 
     def is_closed(self) -> bool:
         return self.closed
@@ -160,9 +176,25 @@ class FakePage:
         if wait_until != "domcontentloaded":
             raise AssertionError("unexpected load state")
 
+    async def wait_for_selector(
+        self,
+        selector: str,
+        *,
+        timeout: int,
+        state: str = "visible",
+    ) -> None:
+        del state
+        self.wait_for_selector_calls += 1
+        self.wait_for_selector_timeout = timeout
+        self.wait_for_selector_selector = selector
+        if self.wait_for_selector_error is not None:
+            raise self.wait_for_selector_error
+
     async def evaluate(self, script: str) -> dict[str, object]:
         if not script:
             raise AssertionError("DOM evidence script is required")
+        if self.evaluate_errors:
+            raise self.evaluate_errors.pop(0)
         if self.evidence_sequence:
             self.evidence = self.evidence_sequence.pop(0)
         return self.evidence
@@ -235,22 +267,22 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
         self._poll_patch = patch("src.services.scraper._DOM_POLL_SECONDS", 0)
-        self._stabilize_patch = patch(
-            "src.services.scraper._POST_RELOAD_STABILIZE_SECONDS",
-            0,
-        )
+        self._retry_patch = patch("src.services.scraper._CONTEXT_RETRY_SECONDS", 0)
+        self._queue_wait_patch = patch("src.services.scraper._QUEUE_UI_WAIT_MS", 0)
         self._cf_hold_patch = patch(
             "src.services.scraper._CF_INTERSTITIAL_HOLD_SECONDS",
             0,
         )
         self._stability_patch.start()
         self._poll_patch.start()
-        self._stabilize_patch.start()
+        self._retry_patch.start()
+        self._queue_wait_patch.start()
         self._cf_hold_patch.start()
 
     async def asyncTearDown(self) -> None:
         self._cf_hold_patch.stop()
-        self._stabilize_patch.stop()
+        self._queue_wait_patch.stop()
+        self._retry_patch.stop()
         self._poll_patch.stop()
         self._stability_patch.stop()
 
@@ -310,7 +342,10 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
         self.assertEqual(page.reload_calls, 1)
         self.assertEqual(page.reload_timeout, 15_000)
+        self.assertEqual(page.wait_for_selector_calls, 1)
+        self.assertEqual(page.wait_for_selector_selector, _QUEUE_UI_SELECTOR)
         self.assertEqual(context.new_page_calls, 0)
+        self.assertEqual(_QUEUE_UI_WAIT_MS, 20_000)
 
     async def test_challenge_latches_and_does_not_reload_again(self) -> None:
         page = FakePage(TARGET_URL, challenge_evidence())
@@ -348,6 +383,33 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.READY)
         self.assertIsNone(health.failure_code)
+
+    async def test_destroyed_execution_context_retries_dom_evaluate(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.evaluate_errors = [
+            PlaywrightError(
+                "Execution context was destroyed, most likely because of a navigation"
+            )
+        ]
+
+        result = await collect_dom_evidence(page)  # type: ignore[arg-type]
+
+        self.assertTrue(result.tel_input_visible)
+        self.assertEqual(result.url, TARGET_URL)
+
+    async def test_queue_ui_wait_retries_after_context_destruction(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.wait_for_selector_error = PlaywrightError(
+            "Execution context was destroyed, most likely because of a navigation"
+        )
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(page.wait_for_selector_calls, 2)
+        self.assertEqual(page.reload_calls, 1)
 
     async def test_rate_limit_message_raises_typed_failure(self) -> None:
         raw = free_evidence()

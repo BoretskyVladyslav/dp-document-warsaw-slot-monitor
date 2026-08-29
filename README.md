@@ -9,7 +9,7 @@ The monitor operates only through CDP attachment to a dedicated, visible Google 
 - Chrome is started by `scripts\start_chrome_cdp.bat`.
 - The script opens `TARGET_URL` in a dedicated persistent profile.
 - A user completes any Cloudflare challenge in that tab.
-- The bot attaches to `CDP_URL`, finds that exact tab, soft-reloads it, and reads visible DOM evidence.
+- The bot attaches to `CDP_URL`, finds that exact tab, reloads it, waits for the occupied banner or telephone field, then reads visible DOM evidence. There is no confirmed in-page refresh control, so a top-level reload remains the refresh path.
 - The bot never launches a browser, creates a tab, imports `cf_clearance`, or falls back to headless Chromium.
 
 Cloudflare access cannot be guaranteed. The reliability contract is fail-closed classification, durable notifications, controlled recovery, and no automated challenge loop.
