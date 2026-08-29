@@ -179,5 +179,47 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sender.sent, [200])
 
 
+    def _free_result(self) -> SlotCheckResult:
+        return SlotCheckResult(
+            status=SlotStatus.FREE_SLOTS_AVAILABLE,
+            checked_at=datetime.now(timezone.utc),
+            slots=("2099-09-10",),
+        )
+
+    async def test_all_transient_failures_keep_state_for_retry(self) -> None:
+        sender = _PerChatSender({100: DeliveryError(100, reason="telegram network error")})
+        notifier = Notifier(
+            database=self.db,
+            sender=sender,
+            city_name="Warsaw",
+            target_url="https://example.test/queue",
+        )
+        first = await notifier.handle_check(self._free_result())
+        self.assertIsNone(first)
+        self.assertEqual(sender.sent, [])
+
+        sender._failures.clear()
+        second = await notifier.handle_check(self._free_result())
+        self.assertEqual(second, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(sender.sent, [100])
+
+        third = await notifier.handle_check(self._free_result())
+        self.assertEqual(third, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(sender.sent, [100])
+
+    async def test_unreachable_commits_state_without_retry(self) -> None:
+        sender = _FailingSender()
+        notifier = Notifier(
+            database=self.db,
+            sender=sender,
+            city_name="Warsaw",
+            target_url="https://example.test/queue",
+        )
+        first = await notifier.handle_check(self._free_result())
+        self.assertEqual(first, SlotStatus.FREE_SLOTS_AVAILABLE)
+        second = await notifier.handle_check(self._free_result())
+        self.assertEqual(second, SlotStatus.FREE_SLOTS_AVAILABLE)
+
+
 if __name__ == "__main__":
     unittest.main()
