@@ -13,6 +13,7 @@ OCCUPIED_HEADING = "наразі всі місця зайняті"
 OCCUPIED_INSTRUCTION = "будь ласка, спробуйте в інший час або день"
 SERVICE_LABEL = "послуга"
 SELECT_PLACEHOLDER = "- обрати -"
+RATE_LIMIT_MESSAGE = "too many requests, please try again later"
 
 _CF_TITLE_MARKERS: tuple[str, ...] = (
     "just a moment",
@@ -49,6 +50,10 @@ def has_cloudflare_challenge(evidence: SlotPageEvidence) -> bool:
         or any(marker in title for marker in _CF_TITLE_MARKERS)
         or any(marker in url for marker in _CF_URL_MARKERS)
     )
+
+
+def has_rate_limit_message(evidence: SlotPageEvidence) -> bool:
+    return RATE_LIMIT_MESSAGE in normalize_visible_text(evidence.visible_text)
 
 
 def classify_slot_evidence(

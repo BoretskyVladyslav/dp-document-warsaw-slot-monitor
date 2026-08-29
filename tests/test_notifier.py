@@ -9,6 +9,7 @@ from src.core.exceptions import (
     CdpUnavailableError,
     CloudflareChallengeError,
     DeliveryError,
+    RateLimitException,
     RecipientUnreachableError,
 )
 from src.core.models import SlotCheckResult, SlotStatus
@@ -17,7 +18,7 @@ from src.database.monitor_state import get_monitor_state
 from src.database.notification_outbox import list_pending_deliveries
 from src.database.schema import init_schema
 from src.database.subscribers import add_subscriber, get_subscriber
-from src.services.notifier import Notifier
+from src.services.notifier import RATE_LIMIT_ALERT, Notifier
 
 TARGET_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
 
@@ -215,6 +216,45 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(is_new)
         self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42, 42])
+
+    async def test_rate_limit_alert_is_deduplicated_and_cooldown_is_extended(
+        self,
+    ) -> None:
+        failure = RateLimitException(
+            "Too many requests, please try again later"
+        )
+        first_until = self.checked_at + timedelta(minutes=15)
+        extended_until = self.checked_at + timedelta(minutes=20)
+
+        first = await self.notifier.handle_rate_limit(
+            failure,
+            attempted_at=self.checked_at,
+            cooldown_until=first_until,
+        )
+        repeated = await self.notifier.handle_rate_limit(
+            failure,
+            attempted_at=self.checked_at + timedelta(minutes=5),
+            cooldown_until=extended_until,
+        )
+        await self.notifier.drain_outbox()
+        state = await get_monitor_state(self.db.connection, "warsaw")
+
+        self.assertTrue(first)
+        self.assertFalse(repeated)
+        assert state is not None
+        self.assertEqual(state.cooldown_until, extended_until)
+        self.assertEqual(self.sender.sent, [(42, RATE_LIMIT_ALERT)])
+
+        await self.notifier.handle_verified_result(
+            self._result(
+                SlotStatus.NO_SLOTS,
+                checked_at=extended_until + timedelta(seconds=1),
+            )
+        )
+        state = await get_monitor_state(self.db.connection, "warsaw")
+        assert state is not None
+        self.assertIsNone(state.cooldown_until)
+        self.assertIsNone(state.human_action_incident_key)
 
     async def test_no_slots_transition_does_not_broadcast(self) -> None:
         transitioned = await self.notifier.handle_verified_result(

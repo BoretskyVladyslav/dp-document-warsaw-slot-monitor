@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
 from src.core.config import Settings
-from src.core.exceptions import HumanActionRequiredError, ScraperError
+from src.core.exceptions import HumanActionRequiredError, RateLimitException, ScraperError
 from src.core.models import (
     MonitorSnapshot,
+    MonitorStateRecord,
     ScraperFailureCode,
     SlotCheckResult,
     SlotStatus,
@@ -22,6 +24,11 @@ from src.services.notifier import Notifier
 from src.services.scraper import SlotScraper
 
 logger = logging.getLogger(__name__)
+_RATE_LIMIT_COOLDOWN_SECONDS = 900
+
+
+def _jittered_check_delay(base_interval: int) -> int:
+    return max(15, base_interval + random.randint(-15, 15))
 
 
 class SlotMonitor:
@@ -42,6 +49,7 @@ class SlotMonitor:
         self._last_result: SlotCheckResult | None = None
         self._cached_state = SlotStatus.UNKNOWN
         self._last_verified_at: datetime | None = None
+        self._cooldown_until: datetime | None = None
         self._singleflight_guard = asyncio.Lock()
         self._inflight_check: asyncio.Task[SlotCheckResult] | None = None
         self._stopping = False
@@ -56,18 +64,26 @@ class SlotMonitor:
             return
         self._cached_state = state.verified_state
         self._last_verified_at = state.last_verified_at
+        now = datetime.now(timezone.utc)
+        self._cooldown_until = (
+            state.cooldown_until
+            if state.cooldown_until is not None and state.cooldown_until > now
+            else None
+        )
 
     async def run_once(self) -> SlotCheckResult:
-        return await self._run_singleflight()
+        return await self._run_singleflight(source="run_once")
 
     async def check_now(self) -> SlotCheckResult:
-        return await self._run_singleflight()
+        return await self._run_singleflight(source="admin")
 
     async def run(self, stop: asyncio.Event) -> None:
         try:
             while not stop.is_set():
-                await self._run_singleflight()
-                delay = self._settings.check_interval_seconds + random.uniform(0, 12)
+                await self._run_singleflight(source="scheduler")
+                delay = _jittered_check_delay(
+                    self._settings.check_interval_seconds
+                )
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=delay)
                 except TimeoutError:
@@ -111,6 +127,7 @@ class SlotMonitor:
             else (persisted.last_attempt_at if persisted is not None else None)
         )
         uptime = (datetime.now(timezone.utc) - self._started_at).total_seconds()
+        cooldown_until = self._active_cooldown_until(persisted)
         return MonitorSnapshot(
             last_check_at=last_verified_at,
             slot_state=verified_state,
@@ -132,20 +149,27 @@ class SlotMonitor:
             last_attempt_at=last_attempt_at,
             last_verified_at=last_verified_at,
             scraper_health=health,
+            cooldown_until=cooldown_until,
         )
 
-    async def _run_singleflight(self) -> SlotCheckResult:
+    async def _run_singleflight(self, *, source: str) -> SlotCheckResult:
+        cooldown_result: SlotCheckResult | None = None
         async with self._singleflight_guard:
             if self._stopping:
                 raise RuntimeError("slot monitor is shutting down")
             task = self._inflight_check
             if task is None or task.done():
-                task = asyncio.create_task(
-                    self._execute_cycle(),
-                    name=f"slot-check:{self.city_key}",
-                )
-                task.add_done_callback(self._observe_cycle_completion)
-                self._inflight_check = task
+                cooldown_result = self._cooldown_result(source=source)
+                if cooldown_result is None:
+                    task = asyncio.create_task(
+                        self._execute_cycle(),
+                        name=f"slot-check:{self.city_key}",
+                    )
+                    task.add_done_callback(self._observe_cycle_completion)
+                    self._inflight_check = task
+        if cooldown_result is not None:
+            await self._notifier.drain_outbox()
+            return cooldown_result
         try:
             return await asyncio.shield(task)
         finally:
@@ -171,6 +195,36 @@ class SlotMonitor:
     async def _execute_cycle(self) -> SlotCheckResult:
         try:
             result = await self._scraper.check_availability()
+        except RateLimitException as exc:
+            checked_at = datetime.now(timezone.utc)
+            cooldown_until = checked_at + timedelta(
+                seconds=_RATE_LIMIT_COOLDOWN_SECONDS
+            )
+            self._cooldown_until = cooldown_until
+            result = SlotCheckResult(
+                status=SlotStatus.UNKNOWN,
+                checked_at=checked_at,
+                details=(
+                    "Server rate limit detected; "
+                    f"cooldown active for {_RATE_LIMIT_COOLDOWN_SECONDS} seconds"
+                ),
+                error=exc.failure_code.value,
+                failure_code=exc.failure_code,
+            )
+            try:
+                await self._notifier.handle_rate_limit(
+                    exc,
+                    attempted_at=checked_at,
+                    cooldown_until=cooldown_until,
+                )
+            except aiosqlite.Error as db_error:
+                logger.exception(
+                    "rate_limit_incident_persist_failed",
+                    extra={
+                        "city": self._settings.city_name,
+                        "error": str(db_error),
+                    },
+                )
         except HumanActionRequiredError as exc:
             result = SlotCheckResult(
                 status=SlotStatus.UNKNOWN,
@@ -206,6 +260,7 @@ class SlotMonitor:
             if result.status is SlotStatus.UNKNOWN:
                 await self._persist_attempt(result)
             else:
+                self._cooldown_until = None
                 self._cached_state = result.status
                 self._last_verified_at = result.checked_at
                 try:
@@ -236,6 +291,46 @@ class SlotMonitor:
         )
         await self._notifier.drain_outbox()
         return result
+
+    def _cooldown_result(self, *, source: str) -> SlotCheckResult | None:
+        cooldown_until = self._cooldown_until
+        if cooldown_until is None:
+            return None
+        now = datetime.now(timezone.utc)
+        remaining = math.ceil((cooldown_until - now).total_seconds())
+        if remaining <= 0:
+            self._cooldown_until = None
+            return None
+        logger.info(
+            "rate_limit_cooldown_active",
+            extra={
+                "city": self._settings.city_name,
+                "remaining_seconds": remaining,
+                "source": source,
+            },
+        )
+        return SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=now,
+            details=f"Rate-limit cooldown active; {remaining} seconds remaining.",
+            error=ScraperFailureCode.RATE_LIMITED.value,
+            failure_code=ScraperFailureCode.RATE_LIMITED,
+        )
+
+    def _active_cooldown_until(
+        self,
+        persisted: MonitorStateRecord | None,
+    ) -> datetime | None:
+        persisted_until = persisted.cooldown_until if persisted is not None else None
+        candidates = [
+            value
+            for value in (self._cooldown_until, persisted_until)
+            if isinstance(value, datetime)
+        ]
+        if not candidates:
+            return None
+        latest = max(candidates)
+        return latest if latest > datetime.now(timezone.utc) else None
 
     async def _persist_attempt(self, result: SlotCheckResult) -> None:
         try:

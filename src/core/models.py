@@ -18,6 +18,7 @@ class ScraperFailureCode(StrEnum):
     CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
     NAVIGATION_TIMEOUT = "navigation_timeout"
     INCONCLUSIVE_PAGE = "inconclusive_page"
+    RATE_LIMITED = "rate_limited"
     SCRAPER_ERROR = "scraper_error"
 
 
@@ -79,6 +80,7 @@ class MonitorStateRecord:
     last_error: str | None
     human_action_incident_key: str | None
     human_action_incident_notified_at: datetime | None
+    cooldown_until: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,3 +116,4 @@ class MonitorSnapshot:
     last_attempt_at: datetime | None = None
     last_verified_at: datetime | None = None
     scraper_health: ScraperHealthSnapshot | None = None
+    cooldown_until: datetime | None = None

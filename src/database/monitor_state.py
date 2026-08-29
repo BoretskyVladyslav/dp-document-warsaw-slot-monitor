@@ -29,7 +29,8 @@ async def get_monitor_state(
             last_details,
             last_error,
             human_action_incident_key,
-            human_action_incident_notified_at
+            human_action_incident_notified_at,
+            cooldown_until
         FROM monitor_state
         WHERE city_key = ?
         """,
@@ -54,6 +55,7 @@ async def get_monitor_state(
         human_action_incident_notified_at=_parse_timestamp(
             row["human_action_incident_notified_at"]
         ),
+        cooldown_until=_parse_timestamp(row["cooldown_until"]),
     )
 
 
@@ -229,7 +231,8 @@ async def clear_human_action_incident(
         """
         UPDATE monitor_state
         SET human_action_incident_key = NULL,
-            human_action_incident_notified_at = NULL
+            human_action_incident_notified_at = NULL,
+            cooldown_until = NULL
         WHERE city_key = ?
         """,
         (city_key,),

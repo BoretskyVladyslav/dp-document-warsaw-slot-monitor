@@ -11,6 +11,7 @@ import aiosqlite
 from src.core.exceptions import (
     DeliveryError,
     HumanActionRequiredError,
+    RateLimitException,
     RecipientUnreachableError,
 )
 from src.core.models import (
@@ -35,6 +36,9 @@ from src.database.subscribers import remove_subscriber
 logger = logging.getLogger(__name__)
 _DISPATCH_CONCURRENCY = 20
 _OUTBOX_BATCH_SIZE = 500
+RATE_LIMIT_ALERT = (
+    "⏸️ Bot is respecting the server's rate limit and pausing for 15 minutes."
+)
 
 
 class _SendOutcome(StrEnum):
@@ -186,6 +190,38 @@ class Notifier:
             extra={
                 "city": self._city_name,
                 "failure_code": error.failure_code.value,
+                "new_incident": is_new,
+                "event_id": event_id,
+            },
+        )
+        return is_new
+
+    async def handle_rate_limit(
+        self,
+        error: RateLimitException,
+        *,
+        attempted_at: datetime,
+        cooldown_until: datetime,
+    ) -> bool:
+        recipients = [
+            NotificationRecipient(chat_id=admin_id)
+            for admin_id in self._admin_ids
+        ]
+        is_new, event_id = await persist_human_action_incident(
+            self._database,
+            city_key=self._city_key,
+            failure_code=error.failure_code,
+            attempted_at=attempted_at,
+            details=str(error),
+            notification_text=RATE_LIMIT_ALERT,
+            recipients=recipients,
+            cooldown_until=cooldown_until,
+        )
+        logger.warning(
+            "rate_limit_cooldown_recorded",
+            extra={
+                "city": self._city_name,
+                "cooldown_until": cooldown_until.isoformat(),
                 "new_incident": is_new,
                 "event_id": event_id,
             },

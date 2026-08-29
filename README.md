@@ -40,7 +40,7 @@ Required settings:
 Optional settings:
 
 - `CITY_NAME`: city label; default `Warsaw`.
-- `CHECK_INTERVAL_SECONDS`: scheduled interval from 15 to 3600 seconds; default `600`.
+- `CHECK_INTERVAL_SECONDS`: scheduled interval from 15 to 3600 seconds; default `300`, with ±15 seconds of jitter.
 - `DATABASE_PATH`: SQLite path; default `data/monitor.db`.
 - `CHECK_ONCE`: perform one cycle and exit; default `false`.
 
@@ -106,6 +106,7 @@ Missing tabs, closed tabs, CDP disconnects, and Cloudflare challenges create a p
 - Repeated checks do not reload a challenged page.
 - Open or refresh the exact target tab and complete the challenge manually.
 - A successful visible-state verification clears the incident and resumes normal soft reloads.
+- A visible `Too many requests` response starts a persistent 15-minute cooldown. Scheduled and manual checks respect it without reloading the page.
 
 ## Telegram commands
 

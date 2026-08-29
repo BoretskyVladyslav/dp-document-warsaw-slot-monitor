@@ -14,7 +14,7 @@ class SettingsTests(unittest.TestCase):
             _env_file=None,
         )
         self.assertEqual(settings.admin_ids, [10, 20, 30])
-        self.assertEqual(settings.check_interval_seconds, 600)
+        self.assertEqual(settings.check_interval_seconds, 300)
 
     def test_parses_single_admin_id_as_list(self) -> None:
         settings = Settings(

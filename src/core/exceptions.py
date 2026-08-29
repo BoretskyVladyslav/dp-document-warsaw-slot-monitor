@@ -53,6 +53,14 @@ class TargetTabClosedError(HumanActionRequiredError):
         super().__init__(message, ScraperFailureCode.TARGET_TAB_CLOSED)
 
 
+class RateLimitException(ScraperError):
+    """The target requested a temporary polling cooldown."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.failure_code = ScraperFailureCode.RATE_LIMITED
+
+
 class NetworkTimeoutError(ScraperError):
     """Navigation or network idle wait timed out."""
 

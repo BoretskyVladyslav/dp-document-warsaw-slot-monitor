@@ -9,6 +9,7 @@ from src.core.config import Settings
 from src.core.exceptions import (
     CdpUnavailableError,
     CloudflareChallengeError,
+    RateLimitException,
     TargetTabClosedError,
     TargetTabMissingError,
 )
@@ -316,6 +317,21 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             health.failure_code,
             ScraperFailureCode.CLOUDFLARE_CHALLENGE,
         )
+
+    async def test_rate_limit_message_raises_typed_failure(self) -> None:
+        raw = free_evidence()
+        raw["visibleText"] = "Too many requests, please try again later"
+        page = FakePage(TARGET_URL, raw)
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        with self.assertRaises(RateLimitException):
+            await scraper.check_availability()
+
+        self.assertEqual(page.reload_calls, 1)
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
+        self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)
 
     async def test_human_refresh_clears_latch_without_worker_reload(self) -> None:
         page = FakePage(TARGET_URL, challenge_evidence())

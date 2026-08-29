@@ -168,7 +168,8 @@ async def persist_verified_result(
                 last_verified_at = excluded.last_verified_at,
                 last_attempt_at = excluded.last_attempt_at,
                 human_action_incident_key = NULL,
-                human_action_incident_notified_at = NULL
+                human_action_incident_notified_at = NULL,
+                cooldown_until = NULL
             """,
             (
                 city_key,
@@ -221,6 +222,7 @@ async def persist_human_action_incident(
     details: str,
     notification_text: str,
     recipients: Sequence[NotificationRecipient],
+    cooldown_until: datetime | None = None,
 ) -> tuple[bool, int | None]:
     async with database.transaction() as connection:
         cursor = await connection.execute(
@@ -241,6 +243,7 @@ async def persist_human_action_incident(
         incident_key = failure_code.value
         is_new = current_key != incident_key
         attempted = attempted_at.isoformat()
+        cooldown = cooldown_until.isoformat() if cooldown_until is not None else None
         notified_at = attempted if is_new and recipients else None
         await connection.execute(
             """
@@ -253,9 +256,10 @@ async def persist_human_action_incident(
                 last_verified_state,
                 last_attempt_at,
                 human_action_incident_key,
-                human_action_incident_notified_at
+                human_action_incident_notified_at,
+                cooldown_until
             )
-            VALUES (?, 'UNKNOWN', ?, ?, ?, 'UNKNOWN', ?, ?, ?)
+            VALUES (?, 'UNKNOWN', ?, ?, ?, 'UNKNOWN', ?, ?, ?, ?)
             ON CONFLICT(city_key) DO UPDATE SET
                 last_check_at = excluded.last_check_at,
                 last_attempt_at = excluded.last_attempt_at,
@@ -267,7 +271,8 @@ async def persist_human_action_incident(
                          excluded.human_action_incident_key
                     THEN monitor_state.human_action_incident_notified_at
                     ELSE excluded.human_action_incident_notified_at
-                END
+                END,
+                cooldown_until = excluded.cooldown_until
             """,
             (
                 city_key,
@@ -277,6 +282,7 @@ async def persist_human_action_incident(
                 attempted,
                 incident_key,
                 notified_at,
+                cooldown,
             ),
         )
         event_id: int | None = None

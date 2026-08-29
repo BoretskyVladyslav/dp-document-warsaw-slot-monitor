@@ -62,6 +62,11 @@ def format_status(snapshot: MonitorSnapshot, *, is_admin: bool) -> str:
     )
     last_error = snapshot.last_error or "—"
     details = snapshot.last_details or "—"
+    cooldown_until = (
+        snapshot.cooldown_until.isoformat(sep=" ", timespec="seconds")
+        if snapshot.cooldown_until is not None
+        else "—"
+    )
     uptime = str(timedelta(seconds=int(snapshot.uptime_seconds)))
     return (
         f"{public_text}\n\n"
@@ -70,6 +75,7 @@ def format_status(snapshot: MonitorSnapshot, *, is_admin: bool) -> str:
         f"CDP підключено: {cdp_connected}\n"
         f"Цільова вкладка: {target_tab}\n"
         f"Причина деградації: {health_reason}\n"
+        f"Cooldown до: {cooldown_until}\n"
         f"Остання помилка: {last_error}\n"
         f"Деталі: {details}\n"
         f"Активних підписників: {snapshot.active_subscribers}\n"

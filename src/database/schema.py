@@ -31,7 +31,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         last_verified_at TEXT,
         last_attempt_at TEXT,
         human_action_incident_key TEXT,
-        human_action_incident_notified_at TEXT
+        human_action_incident_notified_at TEXT,
+        cooldown_until TEXT
     )
     """,
     """
@@ -76,6 +77,7 @@ _MONITOR_STATE_ADDITIONS: tuple[tuple[str, str], ...] = (
     ("last_attempt_at", "TEXT"),
     ("human_action_incident_key", "TEXT"),
     ("human_action_incident_notified_at", "TEXT"),
+    ("cooldown_until", "TEXT"),
 )
 
 

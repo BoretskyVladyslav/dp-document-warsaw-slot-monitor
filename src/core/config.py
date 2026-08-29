@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     bot_token: str = Field(min_length=10)
     admin_ids: list[int] = Field(default_factory=list)
-    check_interval_seconds: int = Field(default=600, ge=15, le=3600)
+    check_interval_seconds: int = Field(default=300, ge=15, le=3600)
     target_url: HttpUrl
     city_name: str = "Warsaw"
     database_path: str = "data/monitor.db"

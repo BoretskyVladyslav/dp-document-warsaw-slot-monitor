@@ -5,10 +5,17 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from src.core.config import Settings
-from src.core.exceptions import CloudflareChallengeError, HumanActionRequiredError
+from src.core.exceptions import (
+    CloudflareChallengeError,
+    HumanActionRequiredError,
+    RateLimitException,
+    ScraperError,
+)
 from src.core.models import (
+    ScraperFailureCode,
     ScraperHealthSnapshot,
     ScraperHealthStatus,
     SlotCheckResult,
@@ -17,7 +24,7 @@ from src.core.models import (
 from src.database.connection import Database
 from src.database.monitor_state import get_monitor_state
 from src.database.schema import init_schema
-from src.services.monitor import SlotMonitor
+from src.services.monitor import SlotMonitor, _jittered_check_delay
 
 TARGET_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
 
@@ -26,7 +33,7 @@ class BlockingScraper:
     def __init__(
         self,
         result: SlotCheckResult | None = None,
-        error: HumanActionRequiredError | None = None,
+        error: ScraperError | None = None,
     ) -> None:
         self.result = result
         self.error = error
@@ -61,6 +68,7 @@ class FakeNotifier:
     def __init__(self) -> None:
         self.verified: list[SlotCheckResult] = []
         self.incidents: list[HumanActionRequiredError] = []
+        self.rate_limits: list[tuple[RateLimitException, datetime, datetime]] = []
         self.drain_calls = 0
 
     async def handle_verified_result(self, result: SlotCheckResult) -> bool:
@@ -75,6 +83,16 @@ class FakeNotifier:
     ) -> bool:
         del attempted_at
         self.incidents.append(error)
+        return True
+
+    async def handle_rate_limit(
+        self,
+        error: RateLimitException,
+        *,
+        attempted_at: datetime,
+        cooldown_until: datetime,
+    ) -> bool:
+        self.rate_limits.append((error, attempted_at, cooldown_until))
         return True
 
     async def drain_outbox(self) -> object:
@@ -113,6 +131,11 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
             notifier=notifier,  # type: ignore[arg-type]
             started_at=self.checked_at,
         )
+
+    def test_negative_jitter_respects_minimum_interval(self) -> None:
+        with patch("src.services.monitor.random.randint", return_value=-15):
+            self.assertEqual(_jittered_check_delay(15), 15)
+            self.assertEqual(_jittered_check_delay(300), 285)
 
     async def test_scheduled_and_manual_checks_share_one_inflight_task(self) -> None:
         result = SlotCheckResult(
@@ -175,6 +198,32 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.last_attempt_at, self.checked_at)
         self.assertEqual(state.last_error, "inconclusive_page")
         self.assertEqual(notifier.verified, [])
+
+    async def test_rate_limit_starts_cooldown_and_manual_check_respects_it(
+        self,
+    ) -> None:
+        failure = RateLimitException(
+            "Too many requests, please try again later"
+        )
+        scraper = BlockingScraper(error=failure)
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+        scraper.release.set()
+
+        detected = await monitor.run_once()
+        skipped = await monitor.check_now()
+
+        self.assertEqual(detected.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(skipped.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertIn("seconds remaining", skipped.details)
+        self.assertEqual(scraper.calls, 1)
+        self.assertEqual(len(notifier.rate_limits), 1)
+        attempted_at, cooldown_until = notifier.rate_limits[0][1:]
+        self.assertEqual(
+            (cooldown_until - attempted_at).total_seconds(),
+            900,
+        )
+        self.assertEqual(notifier.drain_calls, 2)
 
     async def test_cancelling_monitor_run_cancels_and_awaits_inflight_cycle(
         self,

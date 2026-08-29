@@ -8,6 +8,7 @@ from src.core.models import ScraperFailureCode, SlotStatus
 from src.services.slot_parser import (
     SlotPageEvidence,
     classify_slot_evidence,
+    has_rate_limit_message,
     normalize_visible_text,
 )
 
@@ -185,6 +186,12 @@ def test_stale_cloudflare_query_token_does_not_override_visible_form() -> None:
     )
 
     assert result.status is SlotStatus.FREE_SLOTS_AVAILABLE
+
+
+def test_rate_limit_message_is_detected_case_insensitively() -> None:
+    assert has_rate_limit_message(
+        evidence(visible_text="TOO MANY REQUESTS,\nplease try again later")
+    )
 
 
 def test_normalizer_casefolds_whitespace_and_dash_variants() -> None:

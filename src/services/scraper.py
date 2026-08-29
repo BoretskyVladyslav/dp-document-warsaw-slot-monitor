@@ -15,6 +15,7 @@ from src.core.exceptions import (
     CdpUnavailableError,
     CloudflareChallengeError,
     HumanActionRequiredError,
+    RateLimitException,
     TargetTabClosedError,
     TargetTabMissingError,
 )
@@ -33,6 +34,7 @@ from src.services.slot_parser import (
     SlotPageEvidence,
     classify_slot_evidence,
     has_cloudflare_challenge,
+    has_rate_limit_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -223,6 +225,16 @@ class SlotScraper:
                 if self._latched_failure is not None:
                     return await self._probe_latched_page(page)
                 return await self._reload_and_classify(page)
+            except RateLimitException as exc:
+                self._set_health(
+                    status=ScraperHealthStatus.DEGRADED,
+                    cdp_connected=self._browser is not None
+                    and self._browser.is_connected(),
+                    target_tab_present=True,
+                    failure_code=exc.failure_code,
+                    details=str(exc),
+                )
+                raise
             except HumanActionRequiredError as exc:
                 self._latch_human_action(exc)
                 raise
@@ -359,6 +371,7 @@ class SlotScraper:
             if self._page_is_closed(page):
                 raise TargetTabClosedError("target tab closed during soft reload") from exc
             evidence = await collect_dom_evidence(page)
+            self._raise_if_rate_limited(evidence)
             if has_cloudflare_challenge(evidence):
                 raise CloudflareChallengeError(
                     "Cloudflare challenge appeared during soft reload"
@@ -375,6 +388,7 @@ class SlotScraper:
 
     async def _probe_latched_page(self, page: Page) -> SlotCheckResult:
         evidence = await collect_dom_evidence(page)
+        self._raise_if_rate_limited(evidence)
         result = classify_slot_evidence(evidence)
         if has_cloudflare_challenge(evidence):
             raise CloudflareChallengeError(
@@ -402,6 +416,7 @@ class SlotScraper:
         candidate_since: float | None = None
         while True:
             evidence = await collect_dom_evidence(page)
+            self._raise_if_rate_limited(evidence)
             if has_cloudflare_challenge(evidence):
                 raise CloudflareChallengeError(
                     "Cloudflare challenge appeared after soft reload"
@@ -435,6 +450,12 @@ class SlotScraper:
                     ),
                 )
             await asyncio.sleep(_DOM_POLL_SECONDS)
+
+    def _raise_if_rate_limited(self, evidence: SlotPageEvidence) -> None:
+        if has_rate_limit_message(evidence):
+            raise RateLimitException(
+                "Too many requests, please try again later"
+            )
 
     def _unknown_result(
         self,
