@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from src.services.scraper import is_target_closed_error, is_turnstile_frame_url
+from src.services.scraper import (
+    has_cf_clearance_cookie,
+    is_target_closed_error,
+    is_turnstile_frame_url,
+    resolve_browser_profile_dir,
+)
 
 
 class TargetClosedError(Exception):
@@ -27,6 +32,16 @@ class ScraperHelperTests(unittest.TestCase):
             )
         )
         self.assertFalse(is_target_closed_error(RuntimeError("net::ERR_CONNECTION_RESET")))
+
+    def test_relative_profile_resolves_under_repo(self) -> None:
+        resolved = resolve_browser_profile_dir("data/browser_profile")
+        self.assertTrue(resolved.is_absolute())
+        self.assertEqual(resolved.name, "browser_profile")
+        self.assertEqual(resolved.parent.name, "data")
+
+    def test_cf_clearance_cookie_detection(self) -> None:
+        self.assertTrue(has_cf_clearance_cookie([{"name": "cf_clearance", "value": "x"}]))
+        self.assertFalse(has_cf_clearance_cookie([{"name": "__cf_bm", "value": "x"}]))
 
 
 if __name__ == "__main__":

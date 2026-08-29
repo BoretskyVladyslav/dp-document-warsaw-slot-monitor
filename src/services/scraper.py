@@ -19,6 +19,7 @@ from src.services.slot_parser import dumps_payload, is_cloudflare_challenge, par
 from src.services.stealth import CHROME_CLIENT_HINTS, CLOUDFLARE_CLEARED_JS, STEALTH_INIT_SCRIPT
 
 logger = logging.getLogger(__name__)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _MAX_ATTEMPTS = 2
 _CLOUDFLARE_WAIT_MS = 45_000
@@ -55,6 +56,65 @@ def is_target_closed_error(exc: BaseException) -> bool:
     )
 
 
+def resolve_browser_profile_dir(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = _REPO_ROOT / path
+    return path.resolve()
+
+
+def cookie_name_set(cookies: list[dict[str, Any]]) -> frozenset[str]:
+    return frozenset(str(item.get("name", "")) for item in cookies)
+
+
+def has_cf_clearance_cookie(cookies: list[dict[str, Any]]) -> bool:
+    return "cf_clearance" in cookie_name_set(cookies)
+
+
+def persistent_context_kwargs(settings: Settings, user_data_dir: str, *, headless: bool) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "user_data_dir": user_data_dir,
+        "headless": headless,
+        "args": list(_LAUNCH_ARGS),
+        "ignore_default_args": ["--enable-automation"],
+        "user_agent": settings.user_agent,
+        "locale": "uk-UA",
+        "timezone_id": "Europe/Warsaw",
+        "viewport": {"width": 1920, "height": 1080},
+        "screen": {"width": 1920, "height": 1080},
+        "color_scheme": "light",
+        "java_script_enabled": True,
+        "extra_http_headers": CHROME_CLIENT_HINTS,
+    }
+    if settings.proxy_url:
+        kwargs["proxy"] = {"server": settings.proxy_url}
+    return kwargs
+
+
+async def open_persistent_context(
+    settings: Settings,
+    *,
+    headless: bool | None = None,
+) -> tuple[Playwright, BrowserContext, str, Path]:
+    playwright = await async_playwright().start()
+    profile = resolve_browser_profile_dir(settings.browser_profile_dir)
+    profile.mkdir(parents=True, exist_ok=True)
+    headed = settings.headless if headless is None else headless
+    context_kwargs = persistent_context_kwargs(settings, str(profile), headless=headed)
+    try:
+        context = await playwright.chromium.launch_persistent_context(
+            **context_kwargs,
+            channel="chrome",
+        )
+        channel = "chrome"
+    except PlaywrightError as exc:
+        logger.warning("system_chrome_unavailable", extra={"error": str(exc)})
+        context = await playwright.chromium.launch_persistent_context(**context_kwargs)
+        channel = "chromium"
+    await context.add_init_script(STEALTH_INIT_SCRIPT)
+    return playwright, context, channel, profile
+
+
 async def _human_pause(min_s: float = 0.4, max_s: float = 1.8) -> None:
     await asyncio.sleep(random.uniform(min_s, max_s))
 
@@ -75,27 +135,14 @@ class SlotScraper:
             await self._reset()
         if self._context is not None:
             return
-        self._playwright = await async_playwright().start()
-        profile = Path(self._settings.browser_profile_dir)
-        profile.mkdir(parents=True, exist_ok=True)
-        context_kwargs = self._context_kwargs(str(profile))
-        try:
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                **context_kwargs,
-                channel="chrome",
-            )
-            self._browser_channel = "chrome"
-        except PlaywrightError as exc:
-            logger.warning(
-                "system_chrome_unavailable",
-                extra={"error": str(exc)},
-            )
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                **context_kwargs,
-            )
-            self._browser_channel = "chromium"
-        await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+        (
+            self._playwright,
+            self._context,
+            self._browser_channel,
+            profile,
+        ) = await open_persistent_context(self._settings)
         await self._ensure_keepalive_page()
+        cookies = await self._context.cookies()
         logger.info(
             "scraper_started",
             extra={
@@ -103,27 +150,10 @@ class SlotScraper:
                 "headless": self._settings.headless,
                 "channel": self._browser_channel,
                 "profile": str(profile),
+                "cookie_count": len(cookies),
+                "has_cf_clearance": has_cf_clearance_cookie(cookies),
             },
         )
-
-    def _context_kwargs(self, user_data_dir: str) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {
-            "user_data_dir": user_data_dir,
-            "headless": self._settings.headless,
-            "args": list(_LAUNCH_ARGS),
-            "ignore_default_args": ["--enable-automation"],
-            "user_agent": self._settings.user_agent,
-            "locale": "uk-UA",
-            "timezone_id": "Europe/Warsaw",
-            "viewport": {"width": 1920, "height": 1080},
-            "screen": {"width": 1920, "height": 1080},
-            "color_scheme": "light",
-            "java_script_enabled": True,
-            "extra_http_headers": CHROME_CLIENT_HINTS,
-        }
-        if self._settings.proxy_url:
-            kwargs["proxy"] = {"server": self._settings.proxy_url}
-        return kwargs
 
     async def stop(self) -> None:
         if self._context is not None:
