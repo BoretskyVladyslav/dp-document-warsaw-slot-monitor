@@ -50,6 +50,7 @@ async def _amain(settings: Settings) -> None:
             sender=sender,
             city_name=settings.city_name,
             target_url=str(settings.target_url),
+            admin_ids=settings.admin_ids,
         )
         monitor = SlotMonitor(
             settings=settings,

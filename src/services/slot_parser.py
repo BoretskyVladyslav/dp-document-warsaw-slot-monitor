@@ -34,6 +34,7 @@ _CF_TITLE_MARKERS: tuple[str, ...] = (
 _CF_OVERLAY_MARKERS: tuple[str, ...] = (
     "cf-browser-verification",
     "challenge-running",
+    "__cf_chl",
 )
 
 _DATE_RE = re.compile(

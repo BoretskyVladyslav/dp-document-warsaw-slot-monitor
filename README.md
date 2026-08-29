@@ -22,10 +22,11 @@ On Linux/macOS use `cp .env.example .env`. Edit `.env` before the first run.
 | `BOT_TOKEN` | yes | — | Bot token from BotFather |
 | `ADMIN_IDS` | yes for `/status` | empty | Comma-separated Telegram user IDs |
 | `TARGET_URL` | yes | Warsaw e-queue URL | Page Playwright opens each cycle |
-| `CHECK_INTERVAL_SECONDS` | no | `180` | Pause between checks (15–3600) |
+| `CHECK_INTERVAL_SECONDS` | no | `600` | Pause between checks (15–3600) |
 | `PROXY_URL` | no | unset | Playwright proxy, e.g. `http://127.0.0.1:8080` |
 | `CITY_NAME` | no | `Warsaw` | Label used in alerts and `/status` |
 | `HEADLESS` | no | `true` | `false` only for local debugging |
+| `STORAGE_STATE_PATH` | no | `data/storage_state.json` | Cookies from `scripts/solve_session.py` |
 | `DATABASE_PATH` | no | `data/monitor.db` | SQLite file; Compose sets `/app/data/monitor.db` |
 | `SERVICE_OPTION` | no | unset | Dropdown option text to click after load |
 | `PLAYWRIGHT_TIMEOUT_MS` | no | `60000` | Navigation timeout |
@@ -41,6 +42,7 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 playwright install chromium
+python scripts/solve_session.py
 python -m src.main
 ```
 

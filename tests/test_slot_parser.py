@@ -56,6 +56,16 @@ class ParseSlotPageTests(unittest.TestCase):
         self.assertEqual(result.status, SlotStatus.UNKNOWN)
         self.assertEqual(result.error, "cloudflare_challenge")
 
+    def test_cf_chl_token_is_challenge(self) -> None:
+        result = parse_slot_page(
+            html='<script>window._cf_chl = 1; __cf_chl_tk="x"</script>',
+            title="Queue",
+            json_payloads=[],
+            checked_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.error, "cloudflare_challenge")
+
     def test_turnstile_iframe_alone_is_not_challenge(self) -> None:
         result = parse_slot_page(
             html='<iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile"></iframe><p>немає вільних дат</p>',

@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     bot_token: str = Field(min_length=10)
     admin_ids: list[int] = Field(default_factory=list)
-    check_interval_seconds: int = Field(default=180, ge=15, le=3600)
+    check_interval_seconds: int = Field(default=600, ge=15, le=3600)
     target_url: HttpUrl
     city_name: str = "Warsaw"
     proxy_url: str | None = None
@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     database_path: str = "data/monitor.db"
     service_option: str | None = None
     playwright_timeout_ms: int = Field(default=60_000, ge=5_000, le=180_000)
-    browser_profile_dir: str = "data/browser_profile"
+    storage_state_path: str = "data/storage_state.json"
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from src.core.config import Settings
 from src.services.scraper import (
     chrome_launch_args,
     has_cf_clearance_cookie,
     is_target_closed_error,
-    is_turnstile_frame_url,
-    persistent_context_kwargs,
-    resolve_browser_profile_dir,
+    resolve_repo_path,
+    worker_context_kwargs,
 )
 
 
@@ -19,15 +20,6 @@ class TargetClosedError(Exception):
 
 
 class ScraperHelperTests(unittest.TestCase):
-    def test_turnstile_frame_urls(self) -> None:
-        self.assertTrue(
-            is_turnstile_frame_url(
-                "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile"
-            )
-        )
-        self.assertTrue(is_turnstile_frame_url("https://example.com/widget?turnstile=1"))
-        self.assertFalse(is_turnstile_frame_url("https://warszawa.pasport.org.ua/solutions/e-queue"))
-
     def test_target_closed_by_type_and_message(self) -> None:
         self.assertTrue(is_target_closed_error(TargetClosedError("BrowserContext.new_page")))
         self.assertTrue(
@@ -37,10 +29,10 @@ class ScraperHelperTests(unittest.TestCase):
         )
         self.assertFalse(is_target_closed_error(RuntimeError("net::ERR_CONNECTION_RESET")))
 
-    def test_relative_profile_resolves_under_repo(self) -> None:
-        resolved = resolve_browser_profile_dir("data/browser_profile")
+    def test_relative_storage_path_resolves_under_repo(self) -> None:
+        resolved = resolve_repo_path("data/storage_state.json")
         self.assertTrue(resolved.is_absolute())
-        self.assertEqual(resolved.name, "browser_profile")
+        self.assertEqual(resolved.name, "storage_state.json")
         self.assertEqual(resolved.parent.name, "data")
 
     def test_cf_clearance_cookie_detection(self) -> None:
@@ -52,18 +44,32 @@ class ScraperHelperTests(unittest.TestCase):
             bot_token="1234567890:TESTTOKENVALUE",
             target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
         )
-        kwargs = persistent_context_kwargs(settings, "data/browser_profile", headless=False)
-        self.assertEqual(kwargs["ignore_default_args"], ["--enable-automation"])
-        self.assertTrue(kwargs["no_viewport"])
-        self.assertEqual(kwargs["args"], ["--lang=uk-UA,uk"])
+        missing = Path(tempfile.gettempdir()) / "missing-storage-state.json"
+        kwargs = worker_context_kwargs(settings, missing)
+        self.assertNotIn("storage_state", kwargs)
+        self.assertTrue(kwargs.get("no_viewport") or settings.headless)
         banned = {
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-infobars",
-            "--disable-blink-features=AutomationControlled",
         }
-        self.assertTrue(banned.isdisjoint(kwargs["args"]))
+        self.assertTrue(banned.isdisjoint(chrome_launch_args(headless=False)))
+        self.assertEqual(chrome_launch_args(headless=False), ["--lang=uk-UA,uk"])
+
+    def test_worker_context_uses_storage_state_when_file_exists(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+        )
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as handle:
+            path = Path(handle.name)
+            handle.write(b"{}")
+        try:
+            kwargs = worker_context_kwargs(settings, path)
+            self.assertEqual(kwargs["storage_state"], str(path))
+        finally:
+            path.unlink(missing_ok=True)
 
     def test_linux_headless_keeps_container_sandbox_flags(self) -> None:
         args = chrome_launch_args(headless=True)

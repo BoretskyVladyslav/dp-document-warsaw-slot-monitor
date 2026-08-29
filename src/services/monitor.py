@@ -65,7 +65,11 @@ class SlotMonitor:
         uptime = (datetime.now(timezone.utc) - self._started_at).total_seconds()
         return MonitorSnapshot(
             last_check_at=last.checked_at if last else last_check_at,
-            slot_state=last.status if last else (persisted or self._cached_state),
+            slot_state=(
+                last.status
+                if last is not None and last.status is not SlotStatus.UNKNOWN
+                else (persisted or self._cached_state)
+            ),
             last_details=(last.details if last else last_details) or "",
             last_error=last.error if last else last_error,
             active_subscribers=active,
@@ -87,6 +91,8 @@ class SlotMonitor:
                 "slot_count": len(result.slots),
             },
         )
+        if result.error == "session_expired":
+            await self._notifier.notify_session_expired()
         state_to_store = result.status
         if result.status is SlotStatus.UNKNOWN:
             state_to_store = self._cached_state

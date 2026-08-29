@@ -10,6 +10,10 @@ class CloudflareChallengeError(ScraperError):
     """Cloudflare or WAF interstitial detected; slots were not parsed."""
 
 
+class SessionExpiredException(ScraperError):
+    """Saved Playwright storage_state no longer clears the Cloudflare challenge."""
+
+
 class NetworkTimeoutError(ScraperError):
     """Navigation or network idle wait timed out."""
 

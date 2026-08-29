@@ -11,6 +11,11 @@ from src.core.protocols import MessageSender
 from src.database.connection import Database
 from src.database.subscribers import get_all_active_subscribers, remove_subscriber
 
+SESSION_EXPIRED_ALERT = (
+    "⚠️ Сесія Cloudflare застаріла. "
+    "Будь ласка, запустіть scripts/solve_session.py для оновлення."
+)
+
 logger = logging.getLogger(__name__)
 
 _DISPATCH_CONCURRENCY = 20
@@ -70,14 +75,17 @@ class Notifier:
         sender: MessageSender,
         city_name: str,
         target_url: str,
+        admin_ids: list[int] | None = None,
     ) -> None:
         self._database = database
         self._sender = sender
         self._city_name = city_name
         self._target_url = target_url
+        self._admin_ids = tuple(admin_ids or ())
         self._current_state: SlotStatus | None = None
         self._last_notified_state: SlotStatus | None = None
         self._pending_notify: SlotStatus | None = None
+        self._session_alert_sent = False
 
     def prime_previous(self, state: SlotStatus | None) -> None:
         self._current_state = state
@@ -88,6 +96,7 @@ class Notifier:
         if result.status is SlotStatus.UNKNOWN:
             return self._last_notified_state
 
+        self._session_alert_sent = False
         self._current_state = result.status
         last_notified = (
             self._last_notified_state
@@ -142,6 +151,37 @@ class Notifier:
             extra={"city": self._city_name, "recipients": len(subscribers)},
         )
         return self._last_notified_state
+
+    async def notify_session_expired(self) -> None:
+        if self._session_alert_sent:
+            return
+        logger.warning("session_expired_alert", extra={"city": self._city_name})
+        if not self._admin_ids:
+            logger.warning("session_expired_no_admins", extra={"city": self._city_name})
+            self._session_alert_sent = True
+            return
+        delivered = 0
+        for admin_id in self._admin_ids:
+            try:
+                await self._sender.send(admin_id, SESSION_EXPIRED_ALERT)
+                delivered += 1
+            except RecipientUnreachableError:
+                logger.warning(
+                    "session_expired_admin_unreachable",
+                    extra={"chat_id": admin_id},
+                )
+            except (DeliveryError, OSError, TimeoutError) as exc:
+                logger.warning(
+                    "session_expired_alert_failed",
+                    extra={"chat_id": admin_id, "error": str(exc)},
+                )
+            except Exception as exc:
+                logger.exception(
+                    "session_expired_alert_unexpected",
+                    extra={"chat_id": admin_id, "error": str(exc)},
+                )
+        if delivered > 0:
+            self._session_alert_sent = True
 
     def _alert_payload(self, result: SlotCheckResult) -> tuple[str, str]:
         if result.status is SlotStatus.FREE_SLOTS_AVAILABLE:

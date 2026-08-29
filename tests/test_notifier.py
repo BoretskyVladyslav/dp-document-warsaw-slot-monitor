@@ -227,6 +227,26 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(third, SlotStatus.FREE_SLOTS_AVAILABLE)
         self.assertEqual(sender.sent, [100])
 
+    async def test_session_expired_alerts_admins_once(self) -> None:
+        sender = _FakeSender()
+        notifier = Notifier(
+            database=self.db,
+            sender=sender,
+            city_name="Warsaw",
+            target_url="https://example.test/queue",
+            admin_ids=[42],
+        )
+        from src.services.notifier import SESSION_EXPIRED_ALERT
+
+        await notifier.notify_session_expired()
+        await notifier.notify_session_expired()
+        self.assertEqual(sender.sent, [(42, SESSION_EXPIRED_ALERT)])
+
+        await notifier.handle_check(self._free_result())
+        await notifier.notify_session_expired()
+        self.assertEqual(sender.sent[-1], (42, SESSION_EXPIRED_ALERT))
+        self.assertEqual(sum(1 for _chat, text in sender.sent if text == SESSION_EXPIRED_ALERT), 2)
+
     async def test_unreachable_commits_state_without_retry(self) -> None:
         sender = _FailingSender()
         notifier = Notifier(

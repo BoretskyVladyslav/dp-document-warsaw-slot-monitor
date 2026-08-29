@@ -8,28 +8,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from playwright.async_api import BrowserContext, Page, Playwright
+from playwright.async_api import Browser, BrowserContext, Page, Playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from src.core.config import Settings
-from src.core.exceptions import CloudflareChallengeError, NetworkTimeoutError, ScraperError
+from src.core.exceptions import NetworkTimeoutError, ScraperError, SessionExpiredException
 from src.core.models import SlotCheckResult, SlotStatus
 from src.services.slot_parser import dumps_payload, is_cloudflare_challenge, parse_slot_page
-from src.services.stealth import CHROME_CLIENT_HINTS, CLOUDFLARE_CLEARED_JS, STEALTH_INIT_SCRIPT, stealth_async
+from src.services.stealth import CHROME_CLIENT_HINTS, STEALTH_INIT_SCRIPT, stealth_async
 
 logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _MAX_ATTEMPTS = 2
-_CLOUDFLARE_WAIT_MS = 45_000
-_TURNSTILE_IFRAME_SELECTOR = (
-    'iframe[src*="challenges.cloudflare.com"], '
-    'iframe[src*="turnstile"], '
-    ".cf-turnstile iframe, "
-    "#challenge-stage iframe"
-)
 _CONTAINER_HEADLESS_ARGS: list[str] = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
@@ -43,11 +36,6 @@ def chrome_launch_args(*, headless: bool) -> list[str]:
     return [*_CONTAINER_HEADLESS_ARGS, _LANG_ARG]
 
 
-def is_turnstile_frame_url(url: str) -> bool:
-    lowered = url.lower()
-    return "challenges.cloudflare.com" in lowered or "turnstile" in lowered
-
-
 def is_target_closed_error(exc: BaseException) -> bool:
     if type(exc).__name__ == "TargetClosedError":
         return True
@@ -59,27 +47,27 @@ def is_target_closed_error(exc: BaseException) -> bool:
     )
 
 
-def resolve_browser_profile_dir(raw: str) -> Path:
+def resolve_repo_path(raw: str) -> Path:
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = _REPO_ROOT / path
     return path.resolve()
 
 
-def cookie_name_set(cookies: list[dict[str, Any]]) -> frozenset[str]:
-    return frozenset(str(item.get("name", "")) for item in cookies)
-
-
 def has_cf_clearance_cookie(cookies: list[dict[str, Any]]) -> bool:
-    return "cf_clearance" in cookie_name_set(cookies)
+    return any(str(item.get("name", "")) == "cf_clearance" for item in cookies)
 
 
-def persistent_context_kwargs(settings: Settings, user_data_dir: str, *, headless: bool) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "user_data_dir": user_data_dir,
+def browser_launch_kwargs(*, headless: bool) -> dict[str, Any]:
+    return {
         "headless": headless,
         "args": chrome_launch_args(headless=headless),
         "ignore_default_args": ["--enable-automation"],
+    }
+
+
+def worker_context_kwargs(settings: Settings, storage_path: Path) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
         "user_agent": settings.user_agent,
         "locale": "uk-UA",
         "timezone_id": "Europe/Warsaw",
@@ -87,39 +75,16 @@ def persistent_context_kwargs(settings: Settings, user_data_dir: str, *, headles
         "java_script_enabled": True,
         "extra_http_headers": CHROME_CLIENT_HINTS,
     }
-    if headless:
+    if settings.headless:
         kwargs["viewport"] = {"width": 1920, "height": 1080}
         kwargs["screen"] = {"width": 1920, "height": 1080}
     else:
         kwargs["no_viewport"] = True
+    if storage_path.is_file():
+        kwargs["storage_state"] = str(storage_path)
     if settings.proxy_url:
         kwargs["proxy"] = {"server": settings.proxy_url}
     return kwargs
-
-
-async def open_persistent_context(
-    settings: Settings,
-    *,
-    headless: bool | None = None,
-) -> tuple[Playwright, BrowserContext, str, Path]:
-    playwright = await async_playwright().start()
-    profile = resolve_browser_profile_dir(settings.browser_profile_dir)
-    profile.mkdir(parents=True, exist_ok=True)
-    headed = settings.headless if headless is None else headless
-    context_kwargs = persistent_context_kwargs(settings, str(profile), headless=headed)
-    try:
-        context = await playwright.chromium.launch_persistent_context(
-            **context_kwargs,
-            channel="chrome",
-        )
-        channel = "chrome"
-    except PlaywrightError as exc:
-        logger.warning("system_chrome_unavailable", extra={"error": str(exc)})
-        context = await playwright.chromium.launch_persistent_context(**context_kwargs)
-        channel = "chromium"
-    await context.add_init_script(STEALTH_INIT_SCRIPT)
-    await stealth_async(context)
-    return playwright, context, channel, profile
 
 
 async def _human_pause(min_s: float = 0.4, max_s: float = 1.8) -> None:
@@ -130,45 +95,37 @@ class SlotScraper:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._playwright: Playwright | None = None
-        self._context: BrowserContext | None = None
+        self._browser: Browser | None = None
         self._browser_channel: str = "chromium"
 
     async def start(self) -> None:
-        if self._context is not None and not await self._context_is_open():
-            logger.warning(
-                "stale_browser_context",
-                extra={"city": self._settings.city_name},
-            )
-            await self._reset()
-        if self._context is not None:
+        if self._browser is not None and self._browser.is_connected():
             return
-        (
-            self._playwright,
-            self._context,
-            self._browser_channel,
-            profile,
-        ) = await open_persistent_context(self._settings)
-        await self._ensure_keepalive_page()
-        cookies = await self._context.cookies()
+        if self._browser is not None:
+            await self._reset()
+        self._playwright = await async_playwright().start()
+        launch = browser_launch_kwargs(headless=self._settings.headless)
+        try:
+            self._browser = await self._playwright.chromium.launch(channel="chrome", **launch)
+            self._browser_channel = "chrome"
+        except PlaywrightError as exc:
+            logger.warning("system_chrome_unavailable", extra={"error": str(exc)})
+            self._browser = await self._playwright.chromium.launch(**launch)
+            self._browser_channel = "chromium"
+        storage = resolve_repo_path(self._settings.storage_state_path)
         logger.info(
             "scraper_started",
             extra={
                 "city": self._settings.city_name,
                 "headless": self._settings.headless,
                 "channel": self._browser_channel,
-                "profile": str(profile),
-                "cookie_count": len(cookies),
-                "has_cf_clearance": has_cf_clearance_cookie(cookies),
+                "storage_state": str(storage),
+                "storage_state_exists": storage.is_file(),
             },
         )
 
     async def stop(self) -> None:
-        if self._context is not None:
-            try:
-                await self._context.close()
-            except PlaywrightError as exc:
-                logger.warning("context_close_failed", extra={"error": str(exc)})
-            self._context = None
+        await self._close_browser()
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
@@ -179,25 +136,28 @@ class SlotScraper:
     async def check_availability(self) -> SlotCheckResult:
         last_unknown: SlotCheckResult | None = None
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            context: BrowserContext | None = None
             page: Page | None = None
             try:
                 await self.start()
-                assert self._context is not None
-                page = await self._context.new_page()
-                return await self._inspect_page(page)
-            except CloudflareChallengeError as exc:
-                logger.warning(
-                    "cloudflare_challenge",
-                    extra={
-                        "city": self._settings.city_name,
-                        "attempt": attempt,
-                        "error": str(exc),
-                    },
+                assert self._browser is not None
+                storage = resolve_repo_path(self._settings.storage_state_path)
+                context = await self._browser.new_context(
+                    **worker_context_kwargs(self._settings, storage)
                 )
-                last_unknown = SlotCheckResult(
+                await context.add_init_script(STEALTH_INIT_SCRIPT)
+                await stealth_async(context)
+                page = await context.new_page()
+                return await self._inspect_page(page)
+            except SessionExpiredException as exc:
+                logger.warning(
+                    "session_expired",
+                    extra={"city": self._settings.city_name, "error": str(exc)},
+                )
+                return SlotCheckResult(
                     status=SlotStatus.UNKNOWN,
                     checked_at=datetime.now(timezone.utc),
-                    error="cloudflare_challenge",
+                    error="session_expired",
                     details=str(exc),
                 )
             except (NetworkTimeoutError, PlaywrightTimeoutError) as exc:
@@ -234,8 +194,8 @@ class SlotScraper:
                 )
                 await self._reset()
             finally:
-                if page is not None:
-                    await self._close_page(page)
+                await self._close_page(page)
+                await self._close_context(context)
             if attempt < _MAX_ATTEMPTS:
                 delay = 3.0 + random.uniform(0.4, 1.6)
                 logger.info(
@@ -278,20 +238,23 @@ class SlotScraper:
         except PlaywrightTimeoutError as exc:
             raise NetworkTimeoutError(str(exc)) from exc
 
-        await _human_pause(0.8, 2.2)
+        await _human_pause(0.5, 1.2)
+        title = await page.title()
+        html = await page.content()
+        if is_cloudflare_challenge(title=title, html=html):
+            raise SessionExpiredException("Cloudflare challenge interstitial; storage_state must be refreshed")
+
         try:
             await page.wait_for_load_state("networkidle", timeout=min(timeout, 20_000))
         except PlaywrightTimeoutError:
             logger.info("networkidle_skipped", extra={"city": self._settings.city_name})
 
-        await self._wait_out_cloudflare(page, timeout)
         await self._select_service(page)
-        await _human_pause(0.5, 1.5)
-
+        await _human_pause(0.4, 1.0)
         title = await page.title()
         html = await page.content()
         if is_cloudflare_challenge(title=title, html=html):
-            raise CloudflareChallengeError("Cloudflare challenge interstitial on target URL")
+            raise SessionExpiredException("Cloudflare challenge interstitial after load")
 
         return parse_slot_page(
             html=html,
@@ -300,122 +263,9 @@ class SlotScraper:
             checked_at=datetime.now(timezone.utc),
         )
 
-    async def _wait_out_cloudflare(self, page: Page, nav_timeout: int) -> None:
-        if not await self._challenge_visible(page):
-            return
-        logger.info(
-            "cloudflare_wait",
-            extra={"city": self._settings.city_name, "timeout_ms": _CLOUDFLARE_WAIT_MS},
-        )
-        clicked = await self._try_click_turnstile(page)
-        if clicked:
-            logger.info("turnstile_clicked", extra={"city": self._settings.city_name})
-            await _human_pause(0.7, 1.6)
-        try:
-            await page.wait_for_function(CLOUDFLARE_CLEARED_JS, timeout=_CLOUDFLARE_WAIT_MS)
-            await page.wait_for_load_state("domcontentloaded", timeout=nav_timeout)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=min(nav_timeout, 12_000))
-            except PlaywrightTimeoutError:
-                logger.info("challenge_networkidle_skipped", extra={"city": self._settings.city_name})
-            await _human_pause(0.8, 2.0)
-        except PlaywrightTimeoutError as exc:
-            raise CloudflareChallengeError(
-                "Cloudflare/Turnstile challenge did not complete within the wait window"
-            ) from exc
-
-    async def _challenge_visible(self, page: Page) -> bool:
-        if page.is_closed():
-            return False
-        try:
-            title = await page.title()
-            html = await page.content()
-        except PlaywrightError as exc:
-            if is_target_closed_error(exc):
-                raise
-            logger.warning("challenge_detect_failed", extra={"error": str(exc)})
-            return False
-        html_l = html.lower()
-        if is_cloudflare_challenge(title=title, html=html):
-            return True
-        if "challenges.cloudflare.com" in html_l or "cf-turnstile" in html_l:
-            return True
-        try:
-            stage = page.locator("#challenge-stage, .cf-turnstile")
-            return await stage.count() > 0
-        except PlaywrightError as exc:
-            if is_target_closed_error(exc):
-                raise
-            return False
-
-    async def _try_click_turnstile(self, page: Page) -> bool:
-        if page.is_closed():
-            return False
-        try:
-            iframe = page.locator(_TURNSTILE_IFRAME_SELECTOR).first
-            try:
-                await iframe.wait_for(state="attached", timeout=8_000)
-            except PlaywrightTimeoutError:
-                stage = page.locator("#challenge-stage, .cf-turnstile").first
-                if await stage.count() == 0:
-                    return False
-                box = await stage.bounding_box()
-                if box is None:
-                    return False
-                return await self._human_mouse_click(page, box)
-
-            for frame in page.frames:
-                if not is_turnstile_frame_url(frame.url):
-                    continue
-                checkbox = frame.locator(
-                    'input[type="checkbox"], [role="checkbox"], .cb-lb, label.cb-lb'
-                )
-                if await checkbox.count() == 0:
-                    continue
-                box = await checkbox.first.bounding_box()
-                if box is None:
-                    continue
-                logger.info(
-                    "turnstile_checkbox_found",
-                    extra={"city": self._settings.city_name, "frame": frame.url[:120]},
-                )
-                return await self._human_mouse_click(page, box)
-
-            box = await iframe.bounding_box()
-            if box is None:
-                return False
-            checkbox_box = {
-                "x": box["x"] + 8.0,
-                "y": box["y"] + max(8.0, box["height"] * 0.25),
-                "width": min(28.0, max(12.0, box["width"] * 0.2)),
-                "height": min(28.0, max(12.0, box["height"] * 0.5)),
-            }
-            return await self._human_mouse_click(page, checkbox_box)
-        except PlaywrightError as exc:
-            if is_target_closed_error(exc):
-                raise
-            logger.warning("turnstile_click_failed", extra={"error": str(exc)})
-            return False
-
-    async def _human_mouse_click(self, page: Page, box: dict[str, float]) -> bool:
-        x = box["x"] + box["width"] * random.uniform(0.35, 0.65)
-        y = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-        await page.mouse.move(
-            random.uniform(48, 260),
-            random.uniform(90, 420),
-            steps=random.randint(6, 14),
-        )
-        await _human_pause(0.12, 0.42)
-        await page.mouse.move(x, y, steps=random.randint(12, 28))
-        await _human_pause(0.08, 0.28)
-        await page.mouse.down()
-        await _human_pause(0.04, 0.11)
-        await page.mouse.up()
-        return True
-
     async def _select_service(self, page: Page) -> None:
         label = self._settings.service_option
-        if not label:
+        if not label or page.is_closed():
             return
         try:
             select = page.locator("select").first
@@ -438,42 +288,32 @@ class SlotScraper:
                 extra={"label": label, "error": str(exc)},
             )
 
-    async def _context_is_open(self) -> bool:
-        if self._context is None:
-            return False
-        try:
-            _ = self._context.pages
-            await self._context.cookies()
-        except PlaywrightError:
-            return False
-        return True
-
-    async def _ensure_keepalive_page(self) -> None:
-        assert self._context is not None
-        living = [item for item in self._context.pages if not item.is_closed()]
-        if living:
-            keeper = living[0]
-            for extra in living[1:]:
-                await self._close_page(extra)
-            try:
-                if keeper.url != "about:blank":
-                    await keeper.goto("about:blank")
-            except PlaywrightError as exc:
-                logger.warning("keepalive_reset_failed", extra={"error": str(exc)})
+    async def _close_page(self, page: Page | None) -> None:
+        if page is None:
             return
-        keeper = await self._context.new_page()
         try:
-            await keeper.goto("about:blank")
-        except PlaywrightError as extra_exc:
-            logger.warning("keepalive_blank_failed", extra={"error": str(extra_exc)})
-
-    async def _close_page(self, page: Page) -> None:
-        try:
-            if page.is_closed():
-                return
-            await page.close()
+            if not page.is_closed():
+                await page.close()
         except PlaywrightError as exc:
             logger.warning("page_close_failed", extra={"error": str(exc)})
+
+    async def _close_context(self, context: BrowserContext | None) -> None:
+        if context is None:
+            return
+        try:
+            await context.close()
+        except PlaywrightError as exc:
+            logger.warning("context_close_failed", extra={"error": str(exc)})
+
+    async def _close_browser(self) -> None:
+        if self._browser is None:
+            return
+        try:
+            if self._browser.is_connected():
+                await self._browser.close()
+        except PlaywrightError as exc:
+            logger.warning("browser_close_failed", extra={"error": str(exc)})
+        self._browser = None
 
     async def _reset(self) -> None:
         await self.stop()
