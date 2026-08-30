@@ -201,6 +201,7 @@ def test_rate_limit_message_is_detected_case_insensitively() -> None:
         "DateTimeZone::__construct(): Unknown or bad timezone ()",
         "500 Internal Server Error",
         "Виникла помилка при обробці вашого запиту",
+        "Виникла помилка при обробці",
     ],
 )
 def test_backend_error_pages_are_transient_server_error(visible_text: str) -> None:

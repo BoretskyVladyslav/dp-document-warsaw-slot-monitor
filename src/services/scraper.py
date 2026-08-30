@@ -35,6 +35,7 @@ from src.services.slot_parser import (
     classify_slot_evidence,
     has_cloudflare_challenge,
     has_rate_limit_message,
+    has_server_error_page,
 )
 
 logger = logging.getLogger(__name__)
@@ -398,6 +399,9 @@ class SlotScraper:
                 raise CloudflareChallengeError(
                     "Cloudflare challenge appeared during soft reload"
                 ) from exc
+            immediate = self._result_if_server_error(evidence)
+            if immediate is not None:
+                return immediate
             return self._unknown_result(
                 ScraperFailureCode.NAVIGATION_TIMEOUT,
                 "target tab soft reload exceeded 15 seconds",
@@ -406,8 +410,32 @@ class SlotScraper:
             if is_target_closed_error(exc) or self._page_is_closed(page):
                 raise TargetTabClosedError("target tab closed during soft reload") from exc
             raise
+        immediate = await self._peek_terminal_page_state(page)
+        if immediate is not None:
+            return immediate
         await self._wait_for_queue_ui(page)
         return await self._wait_for_decisive_evidence(page)
+
+    async def _peek_terminal_page_state(self, page: Page) -> SlotCheckResult | None:
+        try:
+            evidence = await collect_dom_evidence(page)
+        except PlaywrightError as exc:
+            if is_execution_context_destroyed(exc):
+                return None
+            raise
+        self._raise_if_rate_limited(evidence)
+        return self._result_if_server_error(evidence)
+
+    def _result_if_server_error(
+        self,
+        evidence: SlotPageEvidence,
+    ) -> SlotCheckResult | None:
+        if not has_server_error_page(evidence):
+            return None
+        return self._unknown_result(
+            ScraperFailureCode.SERVER_ERROR,
+            "site_backend_error",
+        )
 
     async def _wait_for_queue_ui(self, page: Page) -> None:
         try:

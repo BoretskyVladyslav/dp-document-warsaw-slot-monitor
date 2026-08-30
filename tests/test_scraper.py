@@ -422,6 +422,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await scraper.check_availability()
 
         self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.wait_for_selector_calls, 0)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
         self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)
@@ -447,6 +448,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, SlotStatus.UNKNOWN)
         self.assertEqual(result.failure_code, ScraperFailureCode.SERVER_ERROR)
         self.assertEqual(result.details, "site_backend_error")
+        self.assertEqual(page.wait_for_selector_calls, 0)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
         self.assertEqual(health.failure_code, ScraperFailureCode.SERVER_ERROR)

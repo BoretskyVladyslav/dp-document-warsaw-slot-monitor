@@ -248,6 +248,24 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(notifier.drain_calls, 2)
 
+    async def test_check_now_rate_limit_enters_cooldown_and_alerts(self) -> None:
+        failure = RateLimitException(
+            "Too many requests, please try again later"
+        )
+        scraper = BlockingScraper(error=failure)
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+        scraper.release.set()
+
+        detected = await monitor.check_now()
+        skipped = await monitor.run_once()
+
+        self.assertEqual(detected.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(skipped.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(scraper.calls, 1)
+        self.assertEqual(len(notifier.rate_limits), 1)
+        self.assertEqual(notifier.drain_calls, 2)
+
     async def test_cancelling_monitor_run_cancels_and_awaits_inflight_cycle(
         self,
     ) -> None:

@@ -17,7 +17,7 @@ RATE_LIMIT_MESSAGE = "too many requests, please try again later"
 _SERVER_ERROR_MARKERS: tuple[str, ...] = (
     "datetimezone::__construct",
     "500 internal server error",
-    "виникла помилка при обробці вашого запиту",
+    "виникла помилка при обробці",
 )
 
 _CF_TITLE_MARKERS: tuple[str, ...] = (
