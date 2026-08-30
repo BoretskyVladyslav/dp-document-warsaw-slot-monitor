@@ -104,10 +104,7 @@ _DOM_EVIDENCE_SCRIPT = f"""
   );
   const challengeVisible = Array.from(document.querySelectorAll(
     "#challenge-running, #challenge-platform, #cf-spinner, .cf-browser-verification"
-  )).some(isVisible)
-    || Array.from(document.querySelectorAll("iframe")).some((iframe) =>
-      String(iframe.getAttribute("src") || "").includes("cf-chl-widget")
-    );
+  )).some(isVisible);
 
   return {{
     title: document.title || "",

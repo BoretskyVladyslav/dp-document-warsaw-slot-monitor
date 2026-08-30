@@ -27,19 +27,11 @@ _SERVER_ERROR_HTML_MARKERS: tuple[str, ...] = (
 
 _CF_TITLE_MARKERS: tuple[str, ...] = (
     "just a moment",
-    "checking your browser",
-    "attention required",
     "трохи зачекайте",
 )
 _CF_BODY_MARKERS: tuple[str, ...] = (
     "триває перевірка безпеки",
     "підтвердьте, що ви людина",
-)
-_CF_HTML_MARKERS: tuple[str, ...] = (
-    "cf-chl-widget",
-)
-_CF_URL_MARKERS: tuple[str, ...] = (
-    "/cdn-cgi/challenge-platform",
 )
 
 
@@ -64,12 +56,9 @@ def normalize_visible_text(value: str) -> str:
 def has_cloudflare_challenge(evidence: SlotPageEvidence) -> bool:
     title = normalize_visible_text(evidence.title)
     visible = normalize_visible_text(evidence.visible_text)
-    url = evidence.url.casefold()
     return (
-        evidence.challenge_visible
-        or any(marker in title for marker in _CF_TITLE_MARKERS)
+        any(marker in title for marker in _CF_TITLE_MARKERS)
         or any(marker in visible for marker in _CF_BODY_MARKERS)
-        or any(marker in url for marker in _CF_URL_MARKERS)
     )
 
 
@@ -80,7 +69,6 @@ def has_cloudflare_source(*, title: str = "", html: str = "") -> bool:
         any(marker in normalized_title for marker in _CF_TITLE_MARKERS)
         or any(marker in normalized_html for marker in _CF_TITLE_MARKERS)
         or any(marker in normalized_html for marker in _CF_BODY_MARKERS)
-        or any(marker in normalized_html for marker in _CF_HTML_MARKERS)
     )
 
 

@@ -595,6 +595,26 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await scraper.check_availability()
         self.assertEqual(page.reload_calls, 1)
 
+    async def test_booking_form_turnstile_iframe_does_not_latch_challenge(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.html = (
+            "<label>Послуга</label><select></select>"
+            '<iframe src="https://challenges.cloudflare.com/'
+            'cdn-cgi/challenge-platform/h/b/cf-chl-widget/abc"></iframe>'
+        )
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.wait_for_selector_calls, 1)
+        self.assertEqual(page.select_option_calls, [0, 1])
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.READY)
+        self.assertIsNone(health.failure_code)
+
     async def test_transient_cloudflare_interstitial_does_not_latch(self) -> None:
         page = FakePage(TARGET_URL)
         page.evidence_sequence = [

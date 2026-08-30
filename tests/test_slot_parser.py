@@ -168,13 +168,6 @@ def test_occupied_banner_with_visible_form_is_no_slots() -> None:
     "challenge_evidence",
     [
         evidence(title="Just a moment..."),
-        evidence(
-            url=(
-                "https://warszawa.pasport.org.ua/cdn-cgi/challenge-platform/"
-                "h/g/orchestrate"
-            )
-        ),
-        evidence(challenge_visible=True),
         evidence(title="Трохи зачекайте..."),
         evidence(visible_text="Триває перевірка безпеки"),
         evidence(visible_text="Підтвердьте, що ви людина"),
@@ -192,11 +185,23 @@ def test_cloudflare_signals_are_unknown(
     assert result.failure_code is ScraperFailureCode.CLOUDFLARE_CHALLENGE
 
 
-def test_ukrainian_turnstile_iframe_is_detected_in_html() -> None:
-    assert has_cloudflare_source(
-        title="Електронна черга",
-        html='<iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/cf-chl-widget/abc"></iframe>',
+def test_embedded_turnstile_iframe_is_not_a_challenge() -> None:
+    iframe_html = (
+        '<iframe src="https://challenges.cloudflare.com/'
+        'cdn-cgi/challenge-platform/h/b/cf-chl-widget/abc"></iframe>'
     )
+    assert not has_cloudflare_source(title="Електронна черга", html=iframe_html)
+    result = classify_slot_evidence(
+        evidence(
+            visible_text="Послуга * - Обрати - Телефон",
+            service_select_visible=True,
+            tel_input_visible=True,
+            service_option_selected=True,
+            challenge_visible=True,
+        ),
+        checked_at=CHECKED_AT,
+    )
+    assert result.status is SlotStatus.FREE_SLOTS_AVAILABLE
     assert has_cloudflare_source(title="Трохи зачекайте...")
 
 
