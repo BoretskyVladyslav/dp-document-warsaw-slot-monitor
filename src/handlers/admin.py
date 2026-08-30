@@ -27,7 +27,7 @@ def build_admin_router(admin_ids: frozenset[int]) -> Router:
         message: Message,
         status_service: StatusService,
     ) -> None:
-        result = await status_service.check_now()
+        result = await status_service.check_now(admin_id=message.chat.id)
         await message.answer(format_check_result(result))
 
     @router.message(Command("check_now"))

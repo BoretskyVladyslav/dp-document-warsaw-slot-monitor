@@ -24,7 +24,11 @@ from src.core.models import (
 from src.database.connection import Database
 from src.database.monitor_state import get_monitor_state
 from src.database.schema import init_schema
-from src.services.monitor import SlotMonitor, _jittered_check_delay
+from src.services.monitor import (
+    SlotMonitor,
+    _jittered_check_delay,
+    _rate_limit_cooldown_seconds,
+)
 
 TARGET_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
 
@@ -137,6 +141,13 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_jittered_check_delay(15), 15)
             self.assertEqual(_jittered_check_delay(300), 285)
 
+    def test_rate_limit_cooldown_doubles_and_caps_at_two_hours(self) -> None:
+        self.assertEqual(_rate_limit_cooldown_seconds(1), 900)
+        self.assertEqual(_rate_limit_cooldown_seconds(2), 1800)
+        self.assertEqual(_rate_limit_cooldown_seconds(3), 3600)
+        self.assertEqual(_rate_limit_cooldown_seconds(4), 7200)
+        self.assertEqual(_rate_limit_cooldown_seconds(5), 7200)
+
     async def test_scheduled_and_manual_checks_share_one_inflight_task(self) -> None:
         result = SlotCheckResult(
             status=SlotStatus.NO_SLOTS,
@@ -149,7 +160,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         scheduled = asyncio.create_task(monitor.run_once())
         await scraper.entered.wait()
-        manual = asyncio.create_task(monitor.check_now())
+        manual = asyncio.create_task(monitor.check_now(admin_id=1))
         await asyncio.sleep(0)
         self.assertEqual(scraper.calls, 1)
 
@@ -160,6 +171,30 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scraper.calls, 1)
         self.assertEqual(notifier.verified, [result])
         self.assertEqual(notifier.drain_calls, 1)
+
+    async def test_manual_check_is_throttled_per_admin(self) -> None:
+        result = SlotCheckResult(
+            status=SlotStatus.NO_SLOTS,
+            checked_at=self.checked_at,
+            details="visible occupied banner",
+        )
+        scraper = BlockingScraper(result=result)
+        scraper.release.set()
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+
+        first = await monitor.check_now(admin_id=1)
+        throttled = await monitor.check_now(admin_id=1)
+        other_admin = await monitor.check_now(admin_id=2)
+        monitor._manual_check_started_at[1] -= 30
+        retried = await monitor.check_now(admin_id=1)
+
+        self.assertIs(first, result)
+        self.assertEqual(throttled.status, SlotStatus.UNKNOWN)
+        self.assertIn("retry in", throttled.details)
+        self.assertIs(other_admin, result)
+        self.assertIs(retried, result)
+        self.assertEqual(scraper.calls, 3)
 
     async def test_human_action_error_becomes_unknown_without_crashing(self) -> None:
         failure = CloudflareChallengeError("challenge visible")
@@ -222,6 +257,36 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notifier.verified, [])
         self.assertEqual(notifier.drain_calls, 1)
 
+    async def test_three_unknown_results_double_scheduler_delay_until_recovery(
+        self,
+    ) -> None:
+        server_error = SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=self.checked_at,
+            details="site_backend_error",
+            error="server_error",
+            failure_code=ScraperFailureCode.SERVER_ERROR,
+        )
+        scraper = BlockingScraper(result=server_error)
+        scraper.release.set()
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+
+        for _ in range(3):
+            await monitor.run_once()
+
+        with patch("src.services.monitor.random.randint", return_value=0):
+            self.assertEqual(monitor._next_check_delay(), 600)
+
+        scraper.result = SlotCheckResult(
+            status=SlotStatus.FREE_SLOTS_AVAILABLE,
+            checked_at=self.checked_at,
+        )
+        await monitor.run_once()
+
+        with patch("src.services.monitor.random.randint", return_value=0):
+            self.assertEqual(monitor._next_check_delay(), 300)
+
     async def test_rate_limit_starts_cooldown_and_manual_check_respects_it(
         self,
     ) -> None:
@@ -234,7 +299,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         scraper.release.set()
 
         detected = await monitor.run_once()
-        skipped = await monitor.check_now()
+        skipped = await monitor.check_now(admin_id=1)
 
         self.assertEqual(detected.failure_code, ScraperFailureCode.RATE_LIMITED)
         self.assertEqual(skipped.failure_code, ScraperFailureCode.RATE_LIMITED)
@@ -257,7 +322,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         monitor = self._monitor(scraper, notifier)
         scraper.release.set()
 
-        detected = await monitor.check_now()
+        detected = await monitor.check_now(admin_id=1)
         skipped = await monitor.run_once()
 
         self.assertEqual(detected.failure_code, ScraperFailureCode.RATE_LIMITED)
@@ -265,6 +330,84 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scraper.calls, 1)
         self.assertEqual(len(notifier.rate_limits), 1)
         self.assertEqual(notifier.drain_calls, 2)
+
+    async def test_consecutive_rate_limits_escalate_cooldown(self) -> None:
+        scraper = BlockingScraper(
+            error=RateLimitException(
+                "Too many requests, please try again later"
+            )
+        )
+        scraper.release.set()
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+
+        for expected_seconds in (900, 1800, 3600, 7200):
+            result = await monitor.run_once()
+            attempted_at, cooldown_until = notifier.rate_limits[-1][1:]
+
+            self.assertEqual(
+                result.failure_code,
+                ScraperFailureCode.RATE_LIMITED,
+            )
+            self.assertEqual(
+                (cooldown_until - attempted_at).total_seconds(),
+                expected_seconds,
+            )
+            monitor._cooldown_until = None
+
+        self.assertEqual(scraper.calls, 4)
+
+    async def test_verified_result_resets_rate_limit_backoff(self) -> None:
+        failure = RateLimitException(
+            "Too many requests, please try again later"
+        )
+        scraper = BlockingScraper(error=failure)
+        scraper.release.set()
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+
+        await monitor.run_once()
+        monitor._cooldown_until = None
+        scraper.error = None
+        scraper.result = SlotCheckResult(
+            status=SlotStatus.NO_SLOTS,
+            checked_at=self.checked_at,
+        )
+        await monitor.run_once()
+        scraper.error = failure
+        await monitor.run_once()
+
+        cooldowns = [
+            (cooldown_until - attempted_at).total_seconds()
+            for _, attempted_at, cooldown_until in notifier.rate_limits
+        ]
+        self.assertEqual(cooldowns, [900, 900])
+
+    async def test_cycle_timeout_returns_unknown_and_allows_next_cycle(self) -> None:
+        scraper = BlockingScraper(
+            result=SlotCheckResult(
+                status=SlotStatus.NO_SLOTS,
+                checked_at=self.checked_at,
+            )
+        )
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+
+        with patch("src.services.monitor._CYCLE_TIMEOUT_SECONDS", 0.01):
+            timed_out = await monitor.run_once()
+
+        self.assertEqual(timed_out.status, SlotStatus.UNKNOWN)
+        self.assertEqual(
+            timed_out.failure_code,
+            ScraperFailureCode.SCRAPER_ERROR,
+        )
+        self.assertTrue(scraper.cancelled.is_set())
+
+        scraper.release.set()
+        recovered = await monitor.run_once()
+
+        self.assertEqual(recovered.status, SlotStatus.NO_SLOTS)
+        self.assertEqual(scraper.calls, 2)
 
     async def test_cancelling_monitor_run_cancels_and_awaits_inflight_cycle(
         self,
@@ -286,7 +429,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(scraper.cancelled.is_set())
         with self.assertRaisesRegex(RuntimeError, "shutting down"):
-            await monitor.check_now()
+            await monitor.check_now(admin_id=1)
 
 
 if __name__ == "__main__":

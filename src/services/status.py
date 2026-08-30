@@ -11,5 +11,5 @@ class StatusService:
     async def get_snapshot(self) -> MonitorSnapshot:
         return await self._monitor.snapshot()
 
-    async def check_now(self) -> SlotCheckResult:
-        return await self._monitor.check_now()
+    async def check_now(self, admin_id: int) -> SlotCheckResult:
+        return await self._monitor.check_now(admin_id=admin_id)

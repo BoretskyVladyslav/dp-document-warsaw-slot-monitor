@@ -24,11 +24,24 @@ from src.services.notifier import Notifier
 from src.services.scraper import SlotScraper
 
 logger = logging.getLogger(__name__)
-_RATE_LIMIT_COOLDOWN_SECONDS = 900
+_CYCLE_TIMEOUT_SECONDS = 60.0
+_MANUAL_CHECK_INTERVAL_SECONDS = 30
+_RATE_LIMIT_BASE_COOLDOWN_SECONDS = 900
+_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 7200
+_UPSTREAM_FAILURE_THRESHOLD = 3
 
 
 def _jittered_check_delay(base_interval: int) -> int:
     return max(15, base_interval + random.randint(-15, 15))
+
+
+def _rate_limit_cooldown_seconds(consecutive: int) -> int:
+    if consecutive < 1:
+        raise ValueError("consecutive rate limits must be positive")
+    return min(
+        _RATE_LIMIT_BASE_COOLDOWN_SECONDS * (2 ** (consecutive - 1)),
+        _RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+    )
 
 
 class SlotMonitor:
@@ -50,6 +63,9 @@ class SlotMonitor:
         self._cached_state = SlotStatus.UNKNOWN
         self._last_verified_at: datetime | None = None
         self._cooldown_until: datetime | None = None
+        self._consecutive_rate_limits = 0
+        self._consecutive_upstream_failures = 0
+        self._manual_check_started_at: dict[int, float] = {}
         self._singleflight_guard = asyncio.Lock()
         self._inflight_check: asyncio.Task[SlotCheckResult] | None = None
         self._stopping = False
@@ -74,16 +90,14 @@ class SlotMonitor:
     async def run_once(self) -> SlotCheckResult:
         return await self._run_singleflight(source="run_once")
 
-    async def check_now(self) -> SlotCheckResult:
-        return await self._run_singleflight(source="admin")
+    async def check_now(self, admin_id: int) -> SlotCheckResult:
+        return await self._run_singleflight(source="admin", admin_id=admin_id)
 
     async def run(self, stop: asyncio.Event) -> None:
         try:
             while not stop.is_set():
                 await self._run_singleflight(source="scheduler")
-                delay = _jittered_check_delay(
-                    self._settings.check_interval_seconds
-                )
+                delay = self._next_check_delay()
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=delay)
                 except TimeoutError:
@@ -152,24 +166,45 @@ class SlotMonitor:
             cooldown_until=cooldown_until,
         )
 
-    async def _run_singleflight(self, *, source: str) -> SlotCheckResult:
-        cooldown_result: SlotCheckResult | None = None
+    async def _run_singleflight(
+        self,
+        *,
+        source: str,
+        admin_id: int | None = None,
+    ) -> SlotCheckResult:
+        immediate_result: SlotCheckResult | None = None
         async with self._singleflight_guard:
             if self._stopping:
                 raise RuntimeError("slot monitor is shutting down")
             task = self._inflight_check
             if task is None or task.done():
-                cooldown_result = self._cooldown_result(source=source)
-                if cooldown_result is None:
+                immediate_result = self._cooldown_result(source=source)
+                if (
+                    immediate_result is None
+                    and source == "admin"
+                    and admin_id is not None
+                ):
+                    immediate_result = self._manual_throttle_result(
+                        admin_id=admin_id
+                    )
+                if immediate_result is None:
+                    if source == "admin":
+                        if admin_id is None:
+                            raise ValueError("admin_id is required for manual checks")
+                        self._manual_check_started_at[admin_id] = (
+                            asyncio.get_running_loop().time()
+                        )
                     task = asyncio.create_task(
-                        self._execute_cycle(),
+                        self._execute_cycle_with_timeout(),
                         name=f"slot-check:{self.city_key}",
                     )
                     task.add_done_callback(self._observe_cycle_completion)
                     self._inflight_check = task
-        if cooldown_result is not None:
+        if immediate_result is not None:
             await self._notifier.drain_outbox()
-            return cooldown_result
+            return immediate_result
+        if task is None:
+            raise RuntimeError("slot check task was not created")
         try:
             return await asyncio.shield(task)
         finally:
@@ -192,13 +227,45 @@ class SlotMonitor:
                 extra={"city": self._settings.city_name, "error": str(error)},
             )
 
+    async def _execute_cycle_with_timeout(self) -> SlotCheckResult:
+        try:
+            return await asyncio.wait_for(
+                self._execute_cycle(),
+                timeout=_CYCLE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            checked_at = datetime.now(timezone.utc)
+            result = SlotCheckResult(
+                status=SlotStatus.UNKNOWN,
+                checked_at=checked_at,
+                details=(
+                    "monitor cycle exceeded "
+                    f"{_CYCLE_TIMEOUT_SECONDS:g} seconds"
+                ),
+                error=ScraperFailureCode.SCRAPER_ERROR.value,
+                failure_code=ScraperFailureCode.SCRAPER_ERROR,
+            )
+            logger.error(
+                "slot_check_timeout",
+                extra={
+                    "city": self._settings.city_name,
+                    "timeout_seconds": _CYCLE_TIMEOUT_SECONDS,
+                },
+            )
+            await self._persist_attempt(result)
+            return await self._finalize_cycle(result)
+
     async def _execute_cycle(self) -> SlotCheckResult:
         try:
             result = await self._scraper.check_availability()
         except RateLimitException as exc:
+            self._consecutive_rate_limits += 1
+            cooldown_seconds = _rate_limit_cooldown_seconds(
+                self._consecutive_rate_limits
+            )
             checked_at = datetime.now(timezone.utc)
             cooldown_until = checked_at + timedelta(
-                seconds=_RATE_LIMIT_COOLDOWN_SECONDS
+                seconds=cooldown_seconds
             )
             self._cooldown_until = cooldown_until
             result = SlotCheckResult(
@@ -206,7 +273,7 @@ class SlotMonitor:
                 checked_at=checked_at,
                 details=(
                     "Server rate limit detected; "
-                    f"cooldown active for {_RATE_LIMIT_COOLDOWN_SECONDS} seconds"
+                    f"cooldown active for {cooldown_seconds} seconds"
                 ),
                 error=exc.failure_code.value,
                 failure_code=exc.failure_code,
@@ -260,6 +327,7 @@ class SlotMonitor:
             if result.status is SlotStatus.UNKNOWN:
                 await self._persist_attempt(result)
             else:
+                self._consecutive_rate_limits = 0
                 self._cooldown_until = None
                 self._cached_state = result.status
                 self._last_verified_at = result.checked_at
@@ -275,7 +343,14 @@ class SlotMonitor:
                         },
                     )
 
+        return await self._finalize_cycle(result)
+
+    async def _finalize_cycle(self, result: SlotCheckResult) -> SlotCheckResult:
         self._last_result = result
+        if result.status is SlotStatus.UNKNOWN:
+            self._consecutive_upstream_failures += 1
+        else:
+            self._consecutive_upstream_failures = 0
         log_extra = {
             "city": self._settings.city_name,
             "status": result.status.value,
@@ -292,6 +367,35 @@ class SlotMonitor:
             logger.info("slot_check", extra=log_extra)
         await self._notifier.drain_outbox()
         return result
+
+    def _manual_throttle_result(self, *, admin_id: int) -> SlotCheckResult | None:
+        last_started_at = self._manual_check_started_at.get(admin_id)
+        if last_started_at is None:
+            return None
+        elapsed = asyncio.get_running_loop().time() - last_started_at
+        remaining = math.ceil(_MANUAL_CHECK_INTERVAL_SECONDS - elapsed)
+        if remaining <= 0:
+            return None
+        now = datetime.now(timezone.utc)
+        logger.info(
+            "manual_check_throttled",
+            extra={
+                "admin_id": admin_id,
+                "city": self._settings.city_name,
+                "remaining_seconds": remaining,
+            },
+        )
+        return SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=now,
+            details=f"Manual check throttled; retry in {remaining} seconds.",
+        )
+
+    def _next_check_delay(self) -> int:
+        interval = self._settings.check_interval_seconds
+        if self._consecutive_upstream_failures >= _UPSTREAM_FAILURE_THRESHOLD:
+            interval *= 2
+        return _jittered_check_delay(interval)
 
     def _cooldown_result(self, *, source: str) -> SlotCheckResult | None:
         cooldown_until = self._cooldown_until

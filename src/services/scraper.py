@@ -338,9 +338,7 @@ class SlotScraper:
             )
 
     def _find_target_page(self) -> Page:
-        browser = self._browser
-        if browser is None or not browser.is_connected():
-            raise CdpUnavailableError("CDP Chrome is not connected")
+        browser = self._require_cdp_connected()
         target_url = str(self._settings.target_url)
         challenge_page_found = False
         open_locations: list[str] = []
@@ -385,6 +383,7 @@ class SlotScraper:
         )
 
     async def _reload_and_classify(self, page: Page) -> SlotCheckResult:
+        self._require_cdp_connected()
         try:
             await page.reload(
                 wait_until="domcontentloaded",
@@ -417,6 +416,7 @@ class SlotScraper:
         return await self._wait_for_decisive_evidence(page)
 
     async def _peek_terminal_page_state(self, page: Page) -> SlotCheckResult | None:
+        self._require_cdp_connected()
         try:
             evidence = await collect_dom_evidence(page)
         except PlaywrightError as exc:
@@ -438,6 +438,7 @@ class SlotScraper:
         )
 
     async def _wait_for_queue_ui(self, page: Page) -> None:
+        self._require_cdp_connected()
         try:
             await page.wait_for_selector(
                 _QUEUE_UI_SELECTOR,
@@ -461,6 +462,7 @@ class SlotScraper:
                 extra={"city": self._settings.city_name, "error": str(exc)},
             )
             await asyncio.sleep(_CONTEXT_RETRY_SECONDS)
+            self._require_cdp_connected()
             if self._page_is_closed(page):
                 raise TargetTabClosedError(
                     "target tab closed while waiting for queue UI"
@@ -489,6 +491,7 @@ class SlotScraper:
                 raise
 
     async def _probe_latched_page(self, page: Page) -> SlotCheckResult:
+        self._require_cdp_connected()
         evidence = await collect_dom_evidence(page)
         self._raise_if_rate_limited(evidence)
         result = classify_slot_evidence(evidence)
@@ -518,6 +521,7 @@ class SlotScraper:
         candidate_since: float | None = None
         challenge_since: float | None = None
         while True:
+            self._require_cdp_connected()
             evidence = await collect_dom_evidence(page)
             self._raise_if_rate_limited(evidence)
             if has_cloudflare_challenge(evidence):
@@ -576,6 +580,12 @@ class SlotScraper:
             raise RateLimitException(
                 "Too many requests, please try again later"
             )
+
+    def _require_cdp_connected(self) -> Browser:
+        browser = self._browser
+        if browser is None or not browser.is_connected():
+            raise CdpUnavailableError("CDP Chrome is not connected")
+        return browser
 
     def _unknown_result(
         self,

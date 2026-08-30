@@ -224,6 +224,16 @@ class FakeBrowser:
         self.connected = False
 
 
+class DisconnectingBrowser(FakeBrowser):
+    def __init__(self, contexts: list[FakeContext]) -> None:
+        super().__init__(contexts)
+        self.connection_checks = 0
+
+    def is_connected(self) -> bool:
+        self.connection_checks += 1
+        return self.connection_checks == 1
+
+
 class FakePlaywright:
     def __init__(self) -> None:
         self.stop_calls = 0
@@ -330,6 +340,17 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.new_page_calls, 0)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.failure_code, ScraperFailureCode.TARGET_TAB_MISSING)
+
+    async def test_disconnected_cdp_fails_before_page_action(self) -> None:
+        page = FakePage(TARGET_URL)
+        context = FakeContext([page])
+        scraper = SlotScraper(settings())
+        scraper._browser = DisconnectingBrowser([context])  # type: ignore[assignment]
+
+        with self.assertRaises(CdpUnavailableError):
+            await scraper.check_availability()
+
+        self.assertEqual(page.reload_calls, 0)
 
     async def test_soft_reload_uses_existing_tab_and_fifteen_second_timeout(self) -> None:
         page = FakePage(TARGET_URL)

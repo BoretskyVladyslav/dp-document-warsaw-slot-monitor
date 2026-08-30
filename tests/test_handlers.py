@@ -26,12 +26,14 @@ class FakeMonitor:
         self._snapshot = snapshot
         self._result = result
         self.check_calls = 0
+        self.admin_ids: list[int] = []
 
     async def snapshot(self) -> MonitorSnapshot:
         return self._snapshot
 
-    async def check_now(self) -> SlotCheckResult:
+    async def check_now(self, admin_id: int) -> SlotCheckResult:
         self.check_calls += 1
+        self.admin_ids.append(admin_id)
         return self._result
 
 
@@ -122,10 +124,11 @@ class HandlerAccessTests(unittest.IsolatedAsyncioTestCase):
         monitor = FakeMonitor(snapshot, result)
         service = StatusService(monitor)  # type: ignore[arg-type]
 
-        returned = await service.check_now()
+        returned = await service.check_now(admin_id=42)
 
         self.assertIs(returned, result)
         self.assertEqual(monitor.check_calls, 1)
+        self.assertEqual(monitor.admin_ids, [42])
 
 
 if __name__ == "__main__":

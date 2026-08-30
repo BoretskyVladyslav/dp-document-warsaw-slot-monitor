@@ -121,7 +121,7 @@ Public:
 Administrator private chats:
 
 - `/status`: public fields plus uptime, latest attempt/error, CDP connection, target-tab presence, and scraper health.
-- `/check_now`: await the current check or start one immediately. It never runs concurrently with a scheduled browser interaction.
+- `/check_now`: await the current check or start one immediately. It never runs concurrently with a scheduled browser interaction and is limited to one new manual check per administrator every 30 seconds.
 
 ## Persistence and delivery
 
