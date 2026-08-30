@@ -28,7 +28,6 @@ from src.core.models import (
 )
 from src.services.slot_parser import (
     OCCUPIED_HEADING,
-    OCCUPIED_INSTRUCTION,
     SELECT_PLACEHOLDER,
     SERVICE_LABEL,
     SlotPageEvidence,
@@ -48,9 +47,12 @@ _DOM_SIGNAL_TIMEOUT_MS = 15_000
 _QUEUE_UI_WAIT_MS = 20_000
 _CONTEXT_RETRY_SECONDS = 3.0
 _DOM_POLL_SECONDS = 0.25
-_DOM_STABILITY_SECONDS = 1.0
+_DOM_STABILITY_SECONDS = 3.0
+_SERVICE_SELECT_SETTLE_SECONDS = 3.0
+_SERVICE_SELECT_TIMEOUT_MS = 5_000
+_SERVICE_OPTION_INDEX = 1
 _CF_INTERSTITIAL_HOLD_SECONDS = 5.0
-_QUEUE_UI_SELECTOR = f"text={OCCUPIED_HEADING}, input[type='tel']"
+_QUEUE_UI_SELECTOR = "select"
 
 _DOM_EVIDENCE_SCRIPT = f"""
 () => {{
@@ -78,8 +80,7 @@ _DOM_EVIDENCE_SCRIPT = f"""
   const occupiedBannerVisible = occupiedContainers.some((element) => {{
     if (!isVisible(element)) return false;
     const text = normalize(element.innerText);
-    return text.includes({OCCUPIED_HEADING!r})
-      && text.includes({OCCUPIED_INSTRUCTION!r});
+    return text.includes({OCCUPIED_HEADING!r});
   }});
 
   const visibleSelects = Array.from(document.querySelectorAll("select"))
@@ -94,6 +95,9 @@ _DOM_EVIDENCE_SCRIPT = f"""
   const telInputVisible = Array.from(
     document.querySelectorAll('input[type="tel"]')
   ).some(isVisible);
+  const serviceOptionSelected = visibleSelects.some(
+    (select) => select.selectedIndex >= 1
+  );
   const challengeVisible = Array.from(document.querySelectorAll(
     "#challenge-running, #challenge-platform, #cf-spinner, .cf-browser-verification"
   )).some(isVisible)
@@ -109,6 +113,7 @@ _DOM_EVIDENCE_SCRIPT = f"""
     serviceSelectVisible,
     selectPlaceholderVisible,
     telInputVisible,
+    serviceOptionSelected,
     challengeVisible,
   }};
 }}
@@ -211,6 +216,7 @@ async def collect_dom_evidence(page: Page) -> SlotPageEvidence:
         service_select_visible=bool(raw.get("serviceSelectVisible")),
         select_placeholder_visible=bool(raw.get("selectPlaceholderVisible")),
         tel_input_visible=bool(raw.get("telInputVisible")),
+        service_option_selected=bool(raw.get("serviceOptionSelected")),
         challenge_visible=bool(raw.get("challengeVisible")),
     )
 
@@ -418,6 +424,7 @@ class SlotScraper:
         if immediate is not None:
             return immediate
         await self._wait_for_queue_ui(page)
+        await self._select_first_service(page)
         return await self._wait_for_decisive_evidence(page)
 
     async def _peek_terminal_page_state(self, page: Page) -> SlotCheckResult | None:
@@ -529,15 +536,87 @@ class SlotScraper:
                     return
                 raise
 
+    async def _select_first_service(self, page: Page) -> None:
+        self._require_cdp_connected()
+        try:
+            await page.locator("select").first.select_option(
+                index=_SERVICE_OPTION_INDEX,
+                timeout=_SERVICE_SELECT_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            logger.info(
+                "service_select_timeout",
+                extra={
+                    "city": self._settings.city_name,
+                    "timeout_ms": _SERVICE_SELECT_TIMEOUT_MS,
+                    "option_index": _SERVICE_OPTION_INDEX,
+                },
+            )
+            return
+        except PlaywrightError as exc:
+            if is_target_closed_error(exc) or self._page_is_closed(page):
+                raise TargetTabClosedError(
+                    "target tab closed while selecting a service"
+                ) from exc
+            if not is_execution_context_destroyed(exc):
+                raise
+            logger.warning(
+                "service_select_context_destroyed",
+                extra={"city": self._settings.city_name, "error": str(exc)},
+            )
+            await asyncio.sleep(_CONTEXT_RETRY_SECONDS)
+            self._require_cdp_connected()
+            if self._page_is_closed(page):
+                raise TargetTabClosedError(
+                    "target tab closed while selecting a service"
+                ) from exc
+            try:
+                await page.locator("select").first.select_option(
+                    index=_SERVICE_OPTION_INDEX,
+                    timeout=_SERVICE_SELECT_TIMEOUT_MS,
+                )
+            except PlaywrightTimeoutError:
+                logger.info(
+                    "service_select_timeout",
+                    extra={
+                        "city": self._settings.city_name,
+                        "timeout_ms": _SERVICE_SELECT_TIMEOUT_MS,
+                        "option_index": _SERVICE_OPTION_INDEX,
+                    },
+                )
+                return
+            except PlaywrightError as retry_exc:
+                if is_target_closed_error(retry_exc) or self._page_is_closed(page):
+                    raise TargetTabClosedError(
+                        "target tab closed while selecting a service"
+                    ) from retry_exc
+                if is_execution_context_destroyed(retry_exc):
+                    return
+                raise
+        logger.info(
+            "service_option_selected",
+            extra={
+                "city": self._settings.city_name,
+                "option_index": _SERVICE_OPTION_INDEX,
+            },
+        )
+        await asyncio.sleep(_SERVICE_SELECT_SETTLE_SECONDS)
+
     async def _probe_latched_page(self, page: Page) -> SlotCheckResult:
         self._require_cdp_connected()
         evidence = await collect_dom_evidence(page)
         self._raise_if_rate_limited(evidence)
-        result = classify_slot_evidence(evidence)
         if has_cloudflare_challenge(evidence):
             raise CloudflareChallengeError(
                 "target tab still requires Cloudflare verification"
             )
+        if has_server_error_page(evidence):
+            return await self._emit_server_error(page)
+        if evidence.service_select_visible:
+            await self._select_first_service(page)
+            evidence = await collect_dom_evidence(page)
+            self._raise_if_rate_limited(evidence)
+        result = classify_slot_evidence(evidence)
         if result.status is SlotStatus.UNKNOWN:
             return result
         self._latched_failure = None

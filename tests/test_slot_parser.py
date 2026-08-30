@@ -27,6 +27,7 @@ def evidence(
     service_select_visible: bool = False,
     select_placeholder_visible: bool = False,
     tel_input_visible: bool = False,
+    service_option_selected: bool = False,
     challenge_visible: bool = False,
 ) -> SlotPageEvidence:
     return SlotPageEvidence(
@@ -37,6 +38,7 @@ def evidence(
         service_select_visible=service_select_visible,
         select_placeholder_visible=select_placeholder_visible,
         tel_input_visible=tel_input_visible,
+        service_option_selected=service_option_selected,
         challenge_visible=challenge_visible,
     )
 
@@ -44,11 +46,12 @@ def evidence(
 def test_visible_occupied_banner_is_no_slots() -> None:
     result = classify_slot_evidence(
         evidence(
-            visible_text=(
-                "Наразі всі місця зайняті.\n"
-                "Будь ласка, спробуйте в інший час або день."
-            ),
+            visible_text="Вибачте, на даний момент всі місця зайняті!",
             occupied_banner_visible=True,
+            service_select_visible=True,
+            select_placeholder_visible=True,
+            tel_input_visible=True,
+            service_option_selected=True,
         ),
         checked_at=CHECKED_AT,
     )
@@ -57,13 +60,28 @@ def test_visible_occupied_banner_is_no_slots() -> None:
     assert result.error is None
 
 
-def test_complete_visible_booking_form_is_free() -> None:
+def test_passive_booking_form_is_not_free() -> None:
     result = classify_slot_evidence(
         evidence(
             visible_text="Послуга *\n- Обрати -\nТелефон",
             service_select_visible=True,
             select_placeholder_visible=True,
             tel_input_visible=True,
+        ),
+        checked_at=CHECKED_AT,
+    )
+
+    assert result.status is SlotStatus.UNKNOWN
+    assert result.failure_code is ScraperFailureCode.INCONCLUSIVE_PAGE
+
+
+def test_selected_service_without_occupied_banner_is_free() -> None:
+    result = classify_slot_evidence(
+        evidence(
+            visible_text="Послуга *\nЗакордонний паспорт та (або) ID-картка\nТелефон",
+            service_select_visible=True,
+            tel_input_visible=True,
+            service_option_selected=True,
         ),
         checked_at=CHECKED_AT,
     )
@@ -103,49 +121,47 @@ def test_partial_form_is_unknown(
 def test_hidden_banner_text_is_not_no_slots() -> None:
     result = classify_slot_evidence(
         evidence(
-            visible_text=(
-                "Наразі всі місця зайняті. "
-                "Будь ласка, спробуйте в інший час або день."
-            ),
+            visible_text="Вибачте, на даний момент всі місця зайняті!",
             occupied_banner_visible=False,
+            service_option_selected=True,
         ),
         checked_at=CHECKED_AT,
     )
 
-    assert result.status is SlotStatus.UNKNOWN
+    assert result.status is SlotStatus.FREE_SLOTS_AVAILABLE
 
 
-def test_visible_banner_without_complete_text_is_unknown() -> None:
+def test_visible_banner_without_occupied_text_is_not_no_slots() -> None:
     result = classify_slot_evidence(
         evidence(
-            visible_text="Наразі всі місця зайняті.",
+            visible_text="Вибачте",
             occupied_banner_visible=True,
-        ),
-        checked_at=CHECKED_AT,
-    )
-
-    assert result.status is SlotStatus.UNKNOWN
-
-
-def test_conflicting_visible_states_are_unknown() -> None:
-    result = classify_slot_evidence(
-        evidence(
-            visible_text=(
-                "Наразі всі місця зайняті. "
-                "Будь ласка, спробуйте в інший час або день. "
-                "Послуга * - Обрати - Телефон"
-            ),
-            occupied_banner_visible=True,
-            service_select_visible=True,
-            select_placeholder_visible=True,
-            tel_input_visible=True,
         ),
         checked_at=CHECKED_AT,
     )
 
     assert result.status is SlotStatus.UNKNOWN
     assert result.failure_code is ScraperFailureCode.INCONCLUSIVE_PAGE
-    assert "conflicting" in result.details
+
+
+def test_occupied_banner_with_visible_form_is_no_slots() -> None:
+    result = classify_slot_evidence(
+        evidence(
+            visible_text=(
+                "Вибачте, на даний момент всі місця зайняті! "
+                "Послуга * - Обрати - Телефон"
+            ),
+            occupied_banner_visible=True,
+            service_select_visible=True,
+            select_placeholder_visible=True,
+            tel_input_visible=True,
+            service_option_selected=True,
+        ),
+        checked_at=CHECKED_AT,
+    )
+
+    assert result.status is SlotStatus.NO_SLOTS
+    assert result.error is None
 
 
 @pytest.mark.parametrize(
@@ -195,6 +211,7 @@ def test_stale_cloudflare_query_token_does_not_override_visible_form() -> None:
             service_select_visible=True,
             select_placeholder_visible=True,
             tel_input_visible=True,
+            service_option_selected=True,
         ),
         checked_at=CHECKED_AT,
     )

@@ -100,9 +100,9 @@ Do not close the dedicated Chrome process or target tab while monitoring.
 
 Only visible DOM evidence is authoritative:
 
-- `NO_SLOTS`: the complete Ukrainian occupied banner is visible.
-- `FREE_SLOTS_AVAILABLE`: the visible service select contains `- Обрати -` and a visible `input[type="tel"]` exists.
-- `UNKNOWN`: evidence is partial, contradictory, challenged, disconnected, timed out, a transient site backend error, or otherwise inconclusive.
+- `NO_SLOTS`: after a service is selected, the occupied banner `"Вибачте, на даний момент всі місця зайняті!"` is visible.
+- `FREE_SLOTS_AVAILABLE`: a real service option is selected and that occupied banner does not appear after a short stability wait.
+- `UNKNOWN`: evidence is partial, challenged, disconnected, timed out, a transient site backend error, or otherwise inconclusive. The booking form alone (service placeholder / telephone field) is not a free-slot signal.
 
 The final visible state must remain stable before it is accepted. `UNKNOWN` never creates a slot alert and never overwrites the last verified business state.
 

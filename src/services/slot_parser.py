@@ -9,8 +9,7 @@ from src.core.models import ScraperFailureCode, SlotCheckResult, SlotStatus
 _WHITESPACE_RE = re.compile(r"\s+")
 _DASH_RE = re.compile(r"[–—−]")
 
-OCCUPIED_HEADING = "наразі всі місця зайняті"
-OCCUPIED_INSTRUCTION = "будь ласка, спробуйте в інший час або день"
+OCCUPIED_HEADING = "вибачте, на даний момент всі місця зайняті!"
 SERVICE_LABEL = "послуга"
 SELECT_PLACEHOLDER = "- обрати -"
 RATE_LIMIT_MESSAGE = "too many requests, please try again later"
@@ -53,6 +52,7 @@ class SlotPageEvidence:
     service_select_visible: bool
     select_placeholder_visible: bool
     tel_input_visible: bool
+    service_option_selected: bool
     challenge_visible: bool
 
 
@@ -139,36 +139,22 @@ def classify_slot_evidence(
         )
 
     visible_text = normalize_visible_text(evidence.visible_text)
-    occupied_text_present = (
-        OCCUPIED_HEADING in visible_text
-        and OCCUPIED_INSTRUCTION in visible_text
-    )
-    occupied = evidence.occupied_banner_visible and occupied_text_present
-    complete_form = (
-        evidence.service_select_visible
-        and evidence.select_placeholder_visible
-        and evidence.tel_input_visible
+    occupied = (
+        evidence.occupied_banner_visible
+        and OCCUPIED_HEADING in visible_text
     )
 
-    if occupied and complete_form:
-        return SlotCheckResult(
-            status=SlotStatus.UNKNOWN,
-            checked_at=moment,
-            error=ScraperFailureCode.INCONCLUSIVE_PAGE.value,
-            failure_code=ScraperFailureCode.INCONCLUSIVE_PAGE,
-            details="conflicting visible occupied banner and booking form",
-        )
     if occupied:
         return SlotCheckResult(
             status=SlotStatus.NO_SLOTS,
             checked_at=moment,
             details="visible occupied banner",
         )
-    if complete_form:
+    if evidence.service_option_selected:
         return SlotCheckResult(
             status=SlotStatus.FREE_SLOTS_AVAILABLE,
             checked_at=moment,
-            details="visible service selector and telephone field",
+            details="service selected without occupied banner",
         )
     return SlotCheckResult(
         status=SlotStatus.UNKNOWN,

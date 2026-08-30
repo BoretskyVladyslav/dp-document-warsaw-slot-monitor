@@ -48,6 +48,7 @@ def free_evidence() -> dict[str, object]:
         "serviceSelectVisible": True,
         "selectPlaceholderVisible": True,
         "telInputVisible": True,
+        "serviceOptionSelected": True,
         "challengeVisible": False,
     }
 
@@ -61,6 +62,7 @@ def challenge_evidence() -> dict[str, object]:
         "serviceSelectVisible": False,
         "selectPlaceholderVisible": False,
         "telInputVisible": False,
+        "serviceOptionSelected": False,
         "challengeVisible": True,
     }
 
@@ -146,6 +148,26 @@ class ScraperHelperTests(unittest.TestCase):
             )
         )
 
+class FakeLocator:
+    def __init__(self, page: FakePage) -> None:
+        self._page = page
+
+    @property
+    def first(self) -> FakeLocator:
+        return self
+
+    async def select_option(
+        self,
+        *,
+        index: int,
+        timeout: int | None = None,
+    ) -> None:
+        self._page.select_option_calls.append(index)
+        self._page.select_option_timeout = timeout
+        if self._page.select_option_error is not None:
+            raise self._page.select_option_error
+
+
 class FakePage:
     def __init__(
         self,
@@ -164,6 +186,10 @@ class FakePage:
         self.wait_for_selector_timeout: int | None = None
         self.wait_for_selector_selector: str | None = None
         self.wait_for_selector_error: BaseException | None = None
+        self.locator_selectors: list[str] = []
+        self.select_option_calls: list[int] = []
+        self.select_option_timeout: int | None = None
+        self.select_option_error: BaseException | None = None
         self.page_title = ""
         self.html = ""
         self.context: FakeContext | None = None
@@ -198,6 +224,10 @@ class FakePage:
         self.wait_for_selector_selector = selector
         if self.wait_for_selector_error is not None:
             raise self.wait_for_selector_error
+
+    def locator(self, selector: str) -> FakeLocator:
+        self.locator_selectors.append(selector)
+        return FakeLocator(self)
 
     async def evaluate(self, script: str) -> dict[str, object]:
         if not script:
@@ -294,6 +324,10 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self._poll_patch = patch("src.services.scraper._DOM_POLL_SECONDS", 0)
         self._retry_patch = patch("src.services.scraper._CONTEXT_RETRY_SECONDS", 0)
         self._queue_wait_patch = patch("src.services.scraper._QUEUE_UI_WAIT_MS", 0)
+        self._settle_patch = patch(
+            "src.services.scraper._SERVICE_SELECT_SETTLE_SECONDS",
+            0,
+        )
         self._cf_hold_patch = patch(
             "src.services.scraper._CF_INTERSTITIAL_HOLD_SECONDS",
             0,
@@ -302,10 +336,12 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self._poll_patch.start()
         self._retry_patch.start()
         self._queue_wait_patch.start()
+        self._settle_patch.start()
         self._cf_hold_patch.start()
 
     async def asyncTearDown(self) -> None:
         self._cf_hold_patch.stop()
+        self._settle_patch.stop()
         self._queue_wait_patch.stop()
         self._retry_patch.stop()
         self._poll_patch.stop()
@@ -380,6 +416,9 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.reload_timeout, 15_000)
         self.assertEqual(page.wait_for_selector_calls, 1)
         self.assertEqual(page.wait_for_selector_selector, _QUEUE_UI_SELECTOR)
+        self.assertEqual(page.locator_selectors, ["select"])
+        self.assertEqual(page.select_option_calls, [1])
+        self.assertEqual(page.select_option_timeout, 5_000)
         self.assertEqual(context.new_page_calls, 0)
         self.assertEqual(_QUEUE_UI_WAIT_MS, 20_000)
 
@@ -410,6 +449,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "serviceSelectVisible": False,
             "selectPlaceholderVisible": False,
             "telInputVisible": False,
+            "serviceOptionSelected": False,
             "challengeVisible": False,
         }
         page = FakePage(TARGET_URL, raw)
@@ -480,6 +520,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
         self.assertEqual(page.wait_for_selector_calls, 2)
+        self.assertEqual(page.select_option_calls, [1])
         self.assertEqual(page.reload_calls, 1)
 
     async def test_rate_limit_message_raises_typed_failure(self) -> None:
@@ -602,7 +643,8 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await scraper.check_availability()
 
         incomplete = free_evidence()
-        incomplete["telInputVisible"] = False
+        incomplete["serviceOptionSelected"] = False
+        incomplete["serviceSelectVisible"] = False
         page.evidence = incomplete
         result = await scraper.check_availability()
 
@@ -645,7 +687,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inconclusive_dom_returns_unknown_without_latching(self) -> None:
         raw = free_evidence()
-        raw["telInputVisible"] = False
+        raw["serviceOptionSelected"] = False
         page = FakePage(TARGET_URL, raw)
         scraper = SlotScraper(settings())
         scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
@@ -663,13 +705,13 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         occupied.update(
             {
                 "visibleText": (
-                    "Наразі всі місця зайняті. "
-                    "Будь ласка, спробуйте в інший час або день."
+                    "Вибачте, на даний момент всі місця зайняті!"
                 ),
                 "occupiedBannerVisible": True,
-                "serviceSelectVisible": False,
-                "selectPlaceholderVisible": False,
-                "telInputVisible": False,
+                "serviceSelectVisible": True,
+                "selectPlaceholderVisible": True,
+                "telInputVisible": True,
+                "serviceOptionSelected": True,
             }
         )
         page = FakePage(TARGET_URL)
