@@ -12,13 +12,13 @@ from src.core.exceptions import (
     RateLimitException,
     RecipientUnreachableError,
 )
-from src.core.models import SlotCheckResult, SlotStatus
+from src.core.models import ScraperFailureCode, SlotCheckResult, SlotStatus
 from src.database.connection import Database
 from src.database.monitor_state import get_monitor_state
 from src.database.notification_outbox import list_pending_deliveries
 from src.database.schema import init_schema
 from src.database.subscribers import add_subscriber, get_subscriber
-from src.services.notifier import RATE_LIMIT_ALERT, Notifier
+from src.services.notifier import Notifier
 
 TARGET_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
 
@@ -243,7 +243,10 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(repeated)
         assert state is not None
         self.assertEqual(state.cooldown_until, extended_until)
-        self.assertEqual(self.sender.sent, [(42, RATE_LIMIT_ALERT)])
+        self.assertEqual(len(self.sender.sent), 1)
+        self.assertEqual(self.sender.sent[0][0], 42)
+        self.assertIn("Cooldown: 900 seconds", self.sender.sent[0][1])
+        self.assertIn("2026-08-29 12:15:00", self.sender.sent[0][1])
 
         await self.notifier.handle_verified_result(
             self._result(
@@ -266,6 +269,44 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(transitioned)
         self.assertEqual(summary.delivered, 0)
         self.assertEqual(self.sender.sent, [])
+
+    async def test_server_error_alert_is_admin_only_and_latched(self) -> None:
+        result = SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=self.checked_at,
+            details="site_backend_error",
+            error="server_error",
+            failure_code=ScraperFailureCode.SERVER_ERROR,
+        )
+        first = await self.notifier.handle_server_error(result)
+        repeated = await self.notifier.handle_server_error(
+            SlotCheckResult(
+                status=SlotStatus.UNKNOWN,
+                checked_at=self.checked_at + timedelta(minutes=3),
+                details="site_backend_error",
+                error="server_error",
+                failure_code=ScraperFailureCode.SERVER_ERROR,
+            )
+        )
+        await self.notifier.drain_outbox()
+
+        self.assertTrue(first)
+        self.assertFalse(repeated)
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42])
+        self.assertIn("site_backend_error", self.sender.sent[0][1])
+        self.assertIn("Cookies", self.sender.sent[0][1])
+
+    async def test_circuit_breaker_alert_is_admin_only(self) -> None:
+        await self.notifier.handle_circuit_breaker(
+            attempted_at=self.checked_at,
+            consecutive_failures=3,
+            next_interval_seconds=600,
+        )
+        await self.notifier.drain_outbox()
+
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42])
+        self.assertIn("Circuit breaker", self.sender.sent[0][1])
+        self.assertIn("600 seconds", self.sender.sent[0][1])
 
 
 if __name__ == "__main__":

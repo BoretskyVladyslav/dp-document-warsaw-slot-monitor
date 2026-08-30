@@ -14,10 +14,16 @@ OCCUPIED_INSTRUCTION = "будь ласка, спробуйте в інший ч
 SERVICE_LABEL = "послуга"
 SELECT_PLACEHOLDER = "- обрати -"
 RATE_LIMIT_MESSAGE = "too many requests, please try again later"
-_SERVER_ERROR_MARKERS: tuple[str, ...] = (
-    "datetimezone::__construct",
+_SERVER_ERROR_VISIBLE_MARKERS: tuple[str, ...] = (
+    "datetimezone",
     "500 internal server error",
-    "виникла помилка при обробці",
+    "виникла помилка",
+    "0 - ",
+)
+_SERVER_ERROR_HTML_MARKERS: tuple[str, ...] = (
+    "datetimezone::__construct",
+    "datetimezone",
+    "500 internal server error",
 )
 
 _CF_TITLE_MARKERS: tuple[str, ...] = (
@@ -61,14 +67,31 @@ def has_rate_limit_message(evidence: SlotPageEvidence) -> bool:
     return RATE_LIMIT_MESSAGE in normalize_visible_text(evidence.visible_text)
 
 
-def has_server_error_page(evidence: SlotPageEvidence) -> bool:
-    haystack = " ".join(
+def has_server_error_source(
+    *,
+    title: str = "",
+    visible_text: str = "",
+    html: str = "",
+) -> bool:
+    visible = " ".join(
         (
-            normalize_visible_text(evidence.title),
-            normalize_visible_text(evidence.visible_text),
+            normalize_visible_text(title),
+            normalize_visible_text(visible_text),
         )
     )
-    return any(marker in haystack for marker in _SERVER_ERROR_MARKERS)
+    if any(marker in visible for marker in _SERVER_ERROR_VISIBLE_MARKERS):
+        return True
+    normalized_html = normalize_visible_text(html)
+    return bool(normalized_html) and any(
+        marker in normalized_html for marker in _SERVER_ERROR_HTML_MARKERS
+    )
+
+
+def has_server_error_page(evidence: SlotPageEvidence) -> bool:
+    return has_server_error_source(
+        title=evidence.title,
+        visible_text=evidence.visible_text,
+    )
 
 
 def classify_slot_evidence(

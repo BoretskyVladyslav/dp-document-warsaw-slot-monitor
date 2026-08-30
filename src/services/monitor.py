@@ -65,6 +65,7 @@ class SlotMonitor:
         self._cooldown_until: datetime | None = None
         self._consecutive_rate_limits = 0
         self._consecutive_upstream_failures = 0
+        self._circuit_breaker_alerted = False
         self._manual_check_started_at: dict[int, float] = {}
         self._singleflight_guard = asyncio.Lock()
         self._inflight_check: asyncio.Task[SlotCheckResult] | None = None
@@ -326,6 +327,17 @@ class SlotMonitor:
         else:
             if result.status is SlotStatus.UNKNOWN:
                 await self._persist_attempt(result)
+                if result.failure_code is ScraperFailureCode.SERVER_ERROR:
+                    try:
+                        await self._notifier.handle_server_error(result)
+                    except aiosqlite.Error as db_error:
+                        logger.exception(
+                            "server_error_incident_persist_failed",
+                            extra={
+                                "city": self._settings.city_name,
+                                "error": str(db_error),
+                            },
+                        )
             else:
                 self._consecutive_rate_limits = 0
                 self._cooldown_until = None
@@ -349,8 +361,30 @@ class SlotMonitor:
         self._last_result = result
         if result.status is SlotStatus.UNKNOWN:
             self._consecutive_upstream_failures += 1
+            if (
+                self._consecutive_upstream_failures >= _UPSTREAM_FAILURE_THRESHOLD
+                and not self._circuit_breaker_alerted
+            ):
+                try:
+                    await self._notifier.handle_circuit_breaker(
+                        attempted_at=result.checked_at,
+                        consecutive_failures=self._consecutive_upstream_failures,
+                        next_interval_seconds=(
+                            self._settings.check_interval_seconds * 2
+                        ),
+                    )
+                    self._circuit_breaker_alerted = True
+                except aiosqlite.Error as db_error:
+                    logger.exception(
+                        "circuit_breaker_incident_persist_failed",
+                        extra={
+                            "city": self._settings.city_name,
+                            "error": str(db_error),
+                        },
+                    )
         else:
             self._consecutive_upstream_failures = 0
+            self._circuit_breaker_alerted = False
         log_extra = {
             "city": self._settings.city_name,
             "status": result.status.value,

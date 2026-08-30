@@ -10,6 +10,7 @@ from src.services.slot_parser import (
     classify_slot_evidence,
     has_rate_limit_message,
     has_server_error_page,
+    has_server_error_source,
     normalize_visible_text,
 )
 
@@ -202,6 +203,7 @@ def test_rate_limit_message_is_detected_case_insensitively() -> None:
         "500 Internal Server Error",
         "Виникла помилка при обробці вашого запиту",
         "Виникла помилка при обробці",
+        "Виникла помилка",
     ],
 )
 def test_backend_error_pages_are_transient_server_error(visible_text: str) -> None:
@@ -211,6 +213,19 @@ def test_backend_error_pages_are_transient_server_error(visible_text: str) -> No
     assert result.status is SlotStatus.UNKNOWN
     assert result.failure_code is ScraperFailureCode.SERVER_ERROR
     assert result.details == "site_backend_error"
+
+
+def test_backend_error_is_detected_in_title_and_html_source() -> None:
+    assert has_server_error_page(evidence(title="0 - "))
+    assert has_server_error_source(
+        title="Електронна черга",
+        html="<pre>DateTimeZone::__construct(): Unknown or bad timezone ()</pre>",
+    )
+    assert has_server_error_source(title="Виникла помилка", html="")
+    assert not has_server_error_source(
+        title="Електронна черга",
+        html="<script>window.msg='Виникла помилка у шаблоні'</script>",
+    )
 
 
 def test_normalizer_casefolds_whitespace_and_dash_variants() -> None:

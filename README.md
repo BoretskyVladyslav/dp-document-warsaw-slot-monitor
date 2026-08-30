@@ -56,6 +56,14 @@ python -m pip install -r requirements.txt
 
 ## Start
 
+For a clean diagnostic restart (stops `src.main`, dedicated CDP Chrome, pending outbox, and monitor latch/cooldown; **keeps subscribers**):
+
+```powershell
+scripts\clean_run.bat
+scripts\start_chrome_cdp.bat
+.venv\Scripts\python.exe -m src.main
+```
+
 Start the dedicated Chrome profile. The optional first argument overrides the default Warsaw URL; the optional second argument overrides port `9222`:
 
 ```powershell
@@ -106,8 +114,9 @@ Missing tabs, closed tabs, CDP disconnects, and Cloudflare challenges create a p
 - Repeated checks do not reload a challenged page.
 - Open or refresh the exact target tab and complete the challenge manually.
 - A successful visible-state verification clears the incident and resumes normal soft reloads.
-- A visible `Too many requests` response starts a persistent 15-minute cooldown. Scheduled and manual checks respect it without reloading the page.
-- PHP/Joomla backend error pages (`DateTimeZone::__construct`, HTTP 500, Ukrainian request-processing errors) are transient `server_error` results: the monitor logs a warning and retries on the next cycle without a human-action alert.
+- A visible `Too many requests` response starts a persistent cooldown (15 minutes, doubling up to 2 hours on consecutive hits). Scheduled and manual checks respect it without reloading the page. Administrators receive one latched alert with the cooldown duration and UTC end time.
+- PHP/Joomla backend error pages (`DateTimeZone::__construct`, HTTP 500, Ukrainian request-processing errors) are transient `server_error` results. Administrators receive one latched diagnostic (cookies were cleared automatically); the monitor retries without treating it as a Cloudflare/CDP human block.
+- Three consecutive UNKNOWN/server_error results double the next poll interval and send one circuit-breaker diagnostic.
 
 ## Telegram commands
 

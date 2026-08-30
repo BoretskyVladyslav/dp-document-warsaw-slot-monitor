@@ -15,6 +15,7 @@ from src.core.exceptions import (
     RecipientUnreachableError,
 )
 from src.core.models import (
+    NotificationEventType,
     NotificationRecipient,
     PendingNotificationDelivery,
     ScraperFailureCode,
@@ -24,6 +25,7 @@ from src.core.models import (
 from src.core.protocols import MessageSender
 from src.database.connection import Database
 from src.database.notification_outbox import (
+    enqueue_notification_event,
     list_pending_deliveries,
     mark_delivery_delivered,
     mark_delivery_failed,
@@ -36,9 +38,21 @@ from src.database.subscribers import remove_subscriber
 logger = logging.getLogger(__name__)
 _DISPATCH_CONCURRENCY = 20
 _OUTBOX_BATCH_SIZE = 500
-RATE_LIMIT_ALERT = (
-    "⏸️ Bot is respecting the server's rate limit and pausing for 15 minutes."
-)
+
+
+def format_rate_limit_alert(
+    *,
+    city_name: str,
+    cooldown_seconds: int,
+    cooldown_until: datetime,
+) -> str:
+    until = cooldown_until.isoformat(sep=" ", timespec="seconds")
+    return (
+        f"⏸️ Rate limit — {city_name}\n\n"
+        f"Cooldown: {cooldown_seconds} seconds\n"
+        f"Until: {until} UTC\n"
+        "Scheduled and /check_now checks will skip until then."
+    )
 
 
 class _SendOutcome(StrEnum):
@@ -106,6 +120,30 @@ def format_human_action_required(
         f"Причина: {failure_code.value}\n"
         f"{action}\n\n"
         f"URL: {target_url}"
+    )
+
+
+def format_server_error_alert(*, city_name: str, target_url: str) -> str:
+    return (
+        f"⚠️ Backend crash — {city_name}\n\n"
+        "Причина: site_backend_error (PHP/Joomla 500 / DateTimeZone)\n"
+        "Cookies for the target tab were cleared automatically.\n"
+        "The monitor will retry on the next cycle without human intervention.\n\n"
+        f"URL: {target_url}"
+    )
+
+
+def format_circuit_breaker_alert(
+    *,
+    city_name: str,
+    consecutive_failures: int,
+    next_interval_seconds: int,
+) -> str:
+    return (
+        f"⚠️ Circuit breaker — {city_name}\n\n"
+        f"{consecutive_failures} consecutive UNKNOWN/server_error results.\n"
+        f"Next poll interval is {next_interval_seconds} seconds "
+        "(double the configured interval) until a conclusive verification."
     )
 
 
@@ -203,6 +241,10 @@ class Notifier:
         attempted_at: datetime,
         cooldown_until: datetime,
     ) -> bool:
+        cooldown_seconds = max(
+            0,
+            int((cooldown_until - attempted_at).total_seconds()),
+        )
         recipients = [
             NotificationRecipient(chat_id=admin_id)
             for admin_id in self._admin_ids
@@ -213,7 +255,11 @@ class Notifier:
             failure_code=error.failure_code,
             attempted_at=attempted_at,
             details=str(error),
-            notification_text=RATE_LIMIT_ALERT,
+            notification_text=format_rate_limit_alert(
+                city_name=self._city_name,
+                cooldown_seconds=cooldown_seconds,
+                cooldown_until=cooldown_until,
+            ),
             recipients=recipients,
             cooldown_until=cooldown_until,
         )
@@ -222,11 +268,78 @@ class Notifier:
             extra={
                 "city": self._city_name,
                 "cooldown_until": cooldown_until.isoformat(),
+                "cooldown_seconds": cooldown_seconds,
                 "new_incident": is_new,
                 "event_id": event_id,
             },
         )
         return is_new
+
+    async def handle_server_error(self, result: SlotCheckResult) -> bool:
+        recipients = [
+            NotificationRecipient(chat_id=admin_id)
+            for admin_id in self._admin_ids
+        ]
+        is_new, event_id = await persist_human_action_incident(
+            self._database,
+            city_key=self._city_key,
+            failure_code=ScraperFailureCode.SERVER_ERROR,
+            attempted_at=result.checked_at,
+            details=result.details or "site_backend_error",
+            notification_text=format_server_error_alert(
+                city_name=self._city_name,
+                target_url=self._target_url,
+            ),
+            recipients=recipients,
+        )
+        logger.warning(
+            "server_error_incident_recorded",
+            extra={
+                "city": self._city_name,
+                "new_incident": is_new,
+                "event_id": event_id,
+            },
+        )
+        return is_new
+
+    async def handle_circuit_breaker(
+        self,
+        *,
+        attempted_at: datetime,
+        consecutive_failures: int,
+        next_interval_seconds: int,
+    ) -> bool:
+        recipients = [
+            NotificationRecipient(chat_id=admin_id)
+            for admin_id in self._admin_ids
+        ]
+        if not recipients:
+            return False
+        text = format_circuit_breaker_alert(
+            city_name=self._city_name,
+            consecutive_failures=consecutive_failures,
+            next_interval_seconds=next_interval_seconds,
+        )
+        async with self._database.write_lock:
+            event_id = await enqueue_notification_event(
+                self._database.connection,
+                city_key=self._city_key,
+                event_key=f"incident:circuit_breaker:{attempted_at.isoformat()}",
+                event_type=NotificationEventType.HUMAN_ACTION_REQUIRED,
+                text=text,
+                recipients=recipients,
+                created_at=attempted_at,
+            )
+        logger.warning(
+            "circuit_breaker_recorded",
+            extra={
+                "city": self._city_name,
+                "consecutive_failures": consecutive_failures,
+                "next_interval_seconds": next_interval_seconds,
+                "event_id": event_id,
+            },
+        )
+        return True
 
     async def drain_outbox(self) -> DispatchSummary:
         async with self._drain_lock:

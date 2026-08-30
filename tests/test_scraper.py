@@ -164,9 +164,18 @@ class FakePage:
         self.wait_for_selector_timeout: int | None = None
         self.wait_for_selector_selector: str | None = None
         self.wait_for_selector_error: BaseException | None = None
+        self.page_title = ""
+        self.html = ""
+        self.context: FakeContext | None = None
 
     def is_closed(self) -> bool:
         return self.closed
+
+    async def title(self) -> str:
+        return self.page_title or str(self.evidence.get("title", ""))
+
+    async def content(self) -> str:
+        return self.html or str(self.evidence.get("visibleText", ""))
 
     async def reload(self, *, wait_until: str, timeout: int) -> None:
         self.reload_calls += 1
@@ -204,10 +213,16 @@ class FakeContext:
     def __init__(self, pages: list[FakePage] | None = None) -> None:
         self.pages = list(pages or [])
         self.new_page_calls = 0
+        self.clear_cookies_calls = 0
+        for page in self.pages:
+            page.context = self
 
     async def new_page(self) -> FakePage:
         self.new_page_calls += 1
         raise AssertionError("strict CDP scraper must not create pages")
+
+    async def clear_cookies(self) -> None:
+        self.clear_cookies_calls += 1
 
 
 class FakeBrowser:
@@ -465,14 +480,68 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
 
         result = await scraper.check_availability()
+        context = page.context
+        assert context is not None
 
         self.assertEqual(result.status, SlotStatus.UNKNOWN)
         self.assertEqual(result.failure_code, ScraperFailureCode.SERVER_ERROR)
         self.assertEqual(result.details, "site_backend_error")
         self.assertEqual(page.wait_for_selector_calls, 0)
+        self.assertEqual(context.clear_cookies_calls, 1)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
         self.assertEqual(health.failure_code, ScraperFailureCode.SERVER_ERROR)
+
+    async def test_php_crash_in_page_source_skips_queue_ui_wait(self) -> None:
+        raw = free_evidence()
+        raw.update(
+            {
+                "title": "0 - ",
+                "visibleText": "",
+                "serviceSelectVisible": False,
+                "selectPlaceholderVisible": False,
+                "telInputVisible": False,
+            }
+        )
+        page = FakePage(TARGET_URL, raw)
+        page.html = (
+            "<pre>DateTimeZone::__construct(): Unknown or bad timezone ()</pre>"
+        )
+        context = FakeContext([page])
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([context])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.failure_code, ScraperFailureCode.SERVER_ERROR)
+        self.assertEqual(result.details, "site_backend_error")
+        self.assertEqual(page.wait_for_selector_calls, 0)
+        self.assertEqual(context.clear_cookies_calls, 1)
+
+    async def test_ukrainian_error_title_skips_queue_ui_wait(self) -> None:
+        raw = free_evidence()
+        raw.update(
+            {
+                "title": "Електронна черга",
+                "visibleText": "",
+                "serviceSelectVisible": False,
+                "selectPlaceholderVisible": False,
+                "telInputVisible": False,
+            }
+        )
+        page = FakePage(TARGET_URL, raw)
+        page.page_title = "Виникла помилка"
+        context = FakeContext([page])
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([context])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.failure_code, ScraperFailureCode.SERVER_ERROR)
+        self.assertEqual(page.wait_for_selector_calls, 0)
+        self.assertEqual(context.clear_cookies_calls, 1)
 
     async def test_human_refresh_clears_latch_without_worker_reload(self) -> None:
         page = FakePage(TARGET_URL, challenge_evidence())

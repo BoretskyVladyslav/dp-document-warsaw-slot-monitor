@@ -73,6 +73,8 @@ class FakeNotifier:
         self.verified: list[SlotCheckResult] = []
         self.incidents: list[HumanActionRequiredError] = []
         self.rate_limits: list[tuple[RateLimitException, datetime, datetime]] = []
+        self.server_errors: list[SlotCheckResult] = []
+        self.circuit_breakers: list[int] = []
         self.drain_calls = 0
 
     async def handle_verified_result(self, result: SlotCheckResult) -> bool:
@@ -97,6 +99,21 @@ class FakeNotifier:
         cooldown_until: datetime,
     ) -> bool:
         self.rate_limits.append((error, attempted_at, cooldown_until))
+        return True
+
+    async def handle_server_error(self, result: SlotCheckResult) -> bool:
+        self.server_errors.append(result)
+        return True
+
+    async def handle_circuit_breaker(
+        self,
+        *,
+        attempted_at: datetime,
+        consecutive_failures: int,
+        next_interval_seconds: int,
+    ) -> bool:
+        del attempted_at, next_interval_seconds
+        self.circuit_breakers.append(consecutive_failures)
         return True
 
     async def drain_outbox(self) -> object:
@@ -234,7 +251,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.last_error, "inconclusive_page")
         self.assertEqual(notifier.verified, [])
 
-    async def test_backend_error_persists_attempt_without_human_alert(self) -> None:
+    async def test_backend_error_alerts_admin_once_per_latch(self) -> None:
         result = SlotCheckResult(
             status=SlotStatus.UNKNOWN,
             checked_at=self.checked_at,
@@ -254,6 +271,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         assert state is not None
         self.assertEqual(state.last_error, "server_error")
         self.assertEqual(notifier.incidents, [])
+        self.assertEqual(notifier.server_errors, [result])
         self.assertEqual(notifier.verified, [])
         self.assertEqual(notifier.drain_calls, 1)
 
@@ -277,6 +295,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("src.services.monitor.random.randint", return_value=0):
             self.assertEqual(monitor._next_check_delay(), 600)
+        self.assertEqual(notifier.circuit_breakers, [3])
 
         scraper.result = SlotCheckResult(
             status=SlotStatus.FREE_SLOTS_AVAILABLE,
