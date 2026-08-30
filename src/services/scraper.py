@@ -28,6 +28,8 @@ from src.core.models import (
     SlotStatus,
 )
 from src.services.slot_parser import (
+    CF_BODY_MARKERS,
+    CF_TITLE_MARKERS,
     OCCUPIED_HEADING,
     SELECT_PLACEHOLDER,
     SERVICE_LABEL,
@@ -55,8 +57,35 @@ _SERVICE_OPTION_INDEX = 1
 _SERVICE_OPTION_ATTACH_TIMEOUT_MS = 10_000
 _SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS = 10_000
 _SUSPICIOUS_VALIDATE_SECONDS = 0.2
-_CF_INTERSTITIAL_HOLD_SECONDS = 5.0
+_CF_INTERSTITIAL_HOLD_SECONDS = 10.0
+_CF_MANAGED_CHALLENGE_HOLD_MS = 10_000
 _QUEUE_UI_SELECTOR = "select"
+
+_MANAGED_CHALLENGE_CLEARED_JS = f"""
+() => {{
+  const normalize = (value) => String(value || "")
+    .toLocaleLowerCase("uk-UA")
+    .replace(/[–—−]/g, "-")
+    .replace(/\\s+/g, " ")
+    .trim();
+  const title = normalize(document.title || "");
+  const body = normalize(document.body ? document.body.innerText : "");
+  const titleMarkers = {list(CF_TITLE_MARKERS)!r};
+  const bodyMarkers = {list(CF_BODY_MARKERS)!r};
+  const blocked = titleMarkers.some((marker) => title.includes(marker))
+    || bodyMarkers.some((marker) => body.includes(marker));
+  const select = document.querySelector("select");
+  if (!(select instanceof Element)) return false;
+  const style = window.getComputedStyle(select);
+  const rect = select.getBoundingClientRect();
+  const visible = style.display !== "none"
+    && style.visibility !== "hidden"
+    && style.opacity !== "0"
+    && rect.width > 0
+    && rect.height > 0;
+  return !blocked && visible;
+}}
+"""
 
 _DOM_EVIDENCE_SCRIPT = f"""
 () => {{
@@ -424,6 +453,7 @@ class SlotScraper:
         immediate = await self._peek_terminal_page_state(page)
         if immediate is not None:
             return immediate
+        await self._wait_out_managed_challenge(page)
         await self._wait_for_queue_ui(page)
         select_result = await self._select_first_service(page)
         if select_result is not None:
@@ -435,10 +465,6 @@ class SlotScraper:
         source = await self._read_page_source(page)
         if source is not None:
             title, html = source
-            if has_cloudflare_source(title=title, html=html):
-                raise CloudflareChallengeError(
-                    "Cloudflare challenge page detected"
-                )
             if has_server_error_source(title=title, html=html):
                 return await self._emit_server_error(page)
         try:
@@ -485,6 +511,84 @@ class SlotScraper:
                 "target_cookie_clear_failed",
                 extra={"city": self._settings.city_name, "error": str(exc)},
             )
+
+    async def _managed_challenge_present(self, page: Page) -> bool:
+        source = await self._read_page_source(page)
+        if source is not None:
+            title, html = source
+            return has_cloudflare_source(title=title, html=html)
+        try:
+            evidence = await collect_dom_evidence(page)
+        except PlaywrightError as exc:
+            if is_execution_context_destroyed(exc):
+                return False
+            raise
+        return has_cloudflare_challenge(evidence)
+
+    async def _wait_out_managed_challenge(self, page: Page) -> None:
+        self._require_cdp_connected()
+        if not await self._managed_challenge_present(page):
+            return
+        logger.info(
+            "managed_challenge_hold",
+            extra={
+                "city": self._settings.city_name,
+                "timeout_ms": _CF_MANAGED_CHALLENGE_HOLD_MS,
+            },
+        )
+        try:
+            await page.wait_for_function(
+                _MANAGED_CHALLENGE_CLEARED_JS,
+                timeout=_CF_MANAGED_CHALLENGE_HOLD_MS,
+            )
+        except PlaywrightTimeoutError:
+            evidence = await collect_dom_evidence(page)
+            if has_cloudflare_challenge(evidence):
+                raise CloudflareChallengeError(
+                    "Cloudflare challenge page detected"
+                )
+            return
+        except PlaywrightError as exc:
+            if is_target_closed_error(exc) or self._page_is_closed(page):
+                raise TargetTabClosedError(
+                    "target tab closed while waiting out Cloudflare challenge"
+                ) from exc
+            if not is_execution_context_destroyed(exc):
+                raise
+            logger.warning(
+                "managed_challenge_wait_context_destroyed",
+                extra={"city": self._settings.city_name, "error": str(exc)},
+            )
+            await asyncio.sleep(_CONTEXT_RETRY_SECONDS)
+            self._require_cdp_connected()
+            if self._page_is_closed(page):
+                raise TargetTabClosedError(
+                    "target tab closed while waiting out Cloudflare challenge"
+                ) from exc
+            try:
+                await page.wait_for_function(
+                    _MANAGED_CHALLENGE_CLEARED_JS,
+                    timeout=_CF_MANAGED_CHALLENGE_HOLD_MS,
+                )
+            except PlaywrightTimeoutError:
+                evidence = await collect_dom_evidence(page)
+                if has_cloudflare_challenge(evidence):
+                    raise CloudflareChallengeError(
+                        "Cloudflare challenge page detected"
+                    )
+                return
+            except PlaywrightError as retry_exc:
+                if is_target_closed_error(retry_exc) or self._page_is_closed(page):
+                    raise TargetTabClosedError(
+                        "target tab closed while waiting out Cloudflare challenge"
+                    ) from retry_exc
+                if is_execution_context_destroyed(retry_exc):
+                    return
+                raise
+        logger.info(
+            "managed_challenge_cleared",
+            extra={"city": self._settings.city_name},
+        )
 
     async def _wait_for_queue_ui(self, page: Page) -> None:
         self._require_cdp_connected()
@@ -716,6 +820,7 @@ class SlotScraper:
         self._require_cdp_connected()
         latched_failure = self._latched_failure
         latched_details = self._health.details
+        await self._wait_out_managed_challenge(page)
         evidence = await collect_dom_evidence(page)
         self._raise_if_rate_limited(evidence)
         if has_cloudflare_challenge(evidence):

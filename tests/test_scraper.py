@@ -17,6 +17,7 @@ from src.core.exceptions import (
 from src.core.models import ScraperFailureCode, ScraperHealthStatus, SlotStatus
 from src.services.scraper import (
     SlotScraper,
+    _CF_MANAGED_CHALLENGE_HOLD_MS,
     _QUEUE_UI_SELECTOR,
     _QUEUE_UI_WAIT_MS,
     cdp_tab_matches,
@@ -255,6 +256,9 @@ class FakePage:
         self.wait_for_selector_timeout: int | None = None
         self.wait_for_selector_selector: str | None = None
         self.wait_for_selector_error: BaseException | None = None
+        self.wait_for_function_calls = 0
+        self.wait_for_function_timeout: int | None = None
+        self.wait_for_function_succeeds = False
         self.locator_selectors: list[str] = []
         self.select_option_calls: list[int] = []
         self.select_option_timeout: int | None = None
@@ -306,6 +310,17 @@ class FakePage:
         self.wait_for_selector_selector = selector
         if self.wait_for_selector_error is not None:
             raise self.wait_for_selector_error
+
+    async def wait_for_function(self, expression: str, *, timeout: int) -> None:
+        del expression
+        self.wait_for_function_calls += 1
+        self.wait_for_function_timeout = timeout
+        if self.wait_for_function_succeeds:
+            self.evidence = free_evidence()
+            self.page_title = str(self.evidence["title"])
+            self.html = str(self.evidence["visibleText"])
+            return
+        raise PlaywrightTimeoutError("Timeout")
 
     def locator(self, selector: str) -> FakeLocator:
         self.locator_selectors.append(selector)
@@ -448,13 +463,19 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "src.services.scraper._CF_INTERSTITIAL_HOLD_SECONDS",
             0,
         )
+        self._managed_hold_patch = patch(
+            "src.services.scraper._CF_MANAGED_CHALLENGE_HOLD_MS",
+            0,
+        )
         self._stability_patch.start()
         self._poll_patch.start()
         self._retry_patch.start()
         self._queue_wait_patch.start()
         self._cf_hold_patch.start()
+        self._managed_hold_patch.start()
 
     async def asyncTearDown(self) -> None:
+        self._managed_hold_patch.stop()
         self._cf_hold_patch.stop()
         self._queue_wait_patch.stop()
         self._retry_patch.stop()
@@ -538,8 +559,10 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.option_wait_calls[0]["timeout"], 10_000)
         self.assertEqual(page.expect_response_calls, 1)
         self.assertEqual(page.expect_response_timeout, 10_000)
+        self.assertEqual(page.wait_for_function_calls, 0)
         self.assertEqual(context.new_page_calls, 0)
         self.assertEqual(_QUEUE_UI_WAIT_MS, 20_000)
+        self.assertEqual(_CF_MANAGED_CHALLENGE_HOLD_MS, 10_000)
 
     async def test_challenge_latches_and_does_not_reload_again(self) -> None:
         page = FakePage(TARGET_URL, challenge_evidence())
@@ -552,6 +575,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await scraper.check_availability()
 
         self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.wait_for_function_calls, 2)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.NEEDS_HUMAN)
         self.assertEqual(
@@ -585,6 +609,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(page.reload_calls, 1)
         self.assertEqual(page.wait_for_selector_calls, 0)
+        self.assertEqual(page.wait_for_function_calls, 1)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.NEEDS_HUMAN)
         self.assertEqual(
@@ -594,6 +619,41 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CloudflareChallengeError):
             await scraper.check_availability()
         self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.wait_for_function_calls, 2)
+
+    async def test_managed_challenge_clears_before_select(self) -> None:
+        page = FakePage(TARGET_URL, challenge_evidence())
+        page.wait_for_function_succeeds = True
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(page.wait_for_function_calls, 1)
+        self.assertEqual(page.select_option_calls, [0, 1])
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.READY)
+        self.assertIsNone(health.failure_code)
+
+    async def test_latched_challenge_recovers_when_form_is_present(self) -> None:
+        page = FakePage(TARGET_URL, challenge_evidence())
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
+
+        page.evidence = free_evidence()
+        page.page_title = ""
+        page.html = ""
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(page.reload_calls, 1)
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.READY)
+        self.assertIsNone(health.failure_code)
 
     async def test_booking_form_turnstile_iframe_does_not_latch_challenge(self) -> None:
         page = FakePage(TARGET_URL)
@@ -610,6 +670,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
         self.assertEqual(page.reload_calls, 1)
         self.assertEqual(page.wait_for_selector_calls, 1)
+        self.assertEqual(page.wait_for_function_calls, 0)
         self.assertEqual(page.select_option_calls, [0, 1])
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.READY)

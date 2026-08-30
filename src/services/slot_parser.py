@@ -25,11 +25,11 @@ _SERVER_ERROR_HTML_MARKERS: tuple[str, ...] = (
     "500 internal server error",
 )
 
-_CF_TITLE_MARKERS: tuple[str, ...] = (
+CF_TITLE_MARKERS: tuple[str, ...] = (
     "just a moment",
     "трохи зачекайте",
 )
-_CF_BODY_MARKERS: tuple[str, ...] = (
+CF_BODY_MARKERS: tuple[str, ...] = (
     "триває перевірка безпеки",
     "підтвердьте, що ви людина",
 )
@@ -57,8 +57,8 @@ def has_cloudflare_challenge(evidence: SlotPageEvidence) -> bool:
     title = normalize_visible_text(evidence.title)
     visible = normalize_visible_text(evidence.visible_text)
     return (
-        any(marker in title for marker in _CF_TITLE_MARKERS)
-        or any(marker in visible for marker in _CF_BODY_MARKERS)
+        any(marker in title for marker in CF_TITLE_MARKERS)
+        or any(marker in visible for marker in CF_BODY_MARKERS)
     )
 
 
@@ -66,9 +66,9 @@ def has_cloudflare_source(*, title: str = "", html: str = "") -> bool:
     normalized_title = normalize_visible_text(title)
     normalized_html = normalize_visible_text(html)
     return (
-        any(marker in normalized_title for marker in _CF_TITLE_MARKERS)
-        or any(marker in normalized_html for marker in _CF_TITLE_MARKERS)
-        or any(marker in normalized_html for marker in _CF_BODY_MARKERS)
+        any(marker in normalized_title for marker in CF_TITLE_MARKERS)
+        or any(marker in normalized_html for marker in CF_TITLE_MARKERS)
+        or any(marker in normalized_html for marker in CF_BODY_MARKERS)
     )
 
 
