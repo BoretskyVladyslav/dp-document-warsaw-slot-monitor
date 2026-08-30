@@ -18,6 +18,7 @@ class ScraperFailureCode(StrEnum):
     CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
     NAVIGATION_TIMEOUT = "navigation_timeout"
     INCONCLUSIVE_PAGE = "inconclusive_page"
+    SERVICE_VALIDATE_ERROR = "service_validate_error"
     SERVER_ERROR = "server_error"
     RATE_LIMITED = "rate_limited"
     SCRAPER_ERROR = "scraper_error"

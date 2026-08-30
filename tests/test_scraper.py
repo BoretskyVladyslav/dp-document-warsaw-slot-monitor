@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from src.core.config import Settings
 from src.core.exceptions import (
@@ -148,13 +149,74 @@ class ScraperHelperTests(unittest.TestCase):
             )
         )
 
-class FakeLocator:
+class FakeRequest:
+    def __init__(self, url: str, resource_type: str = "xhr") -> None:
+        self.url = url
+        self.resource_type = resource_type
+
+
+class FakeResponse:
+    def __init__(self, url: str, status: int, request: FakeRequest) -> None:
+        self.url = url
+        self.status = status
+        self.request = request
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 300
+
+
+class FakeExpectResponse:
     def __init__(self, page: FakePage) -> None:
         self._page = page
+        self._response: FakeResponse | None = None
+
+    async def __aenter__(self) -> FakeExpectResponse:
+        self._page._active_expect = self
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        self._page._active_expect = None
+
+    @property
+    def value(self) -> object:
+        return self._resolve()
+
+    async def _resolve(self) -> FakeResponse:
+        if self._page.expect_response_error is not None:
+            raise self._page.expect_response_error
+        if self._response is None:
+            self._response = self._page.build_validate_response()
+        return self._response
+
+
+class FakeLocator:
+    def __init__(self, page: FakePage, selector: str = "select") -> None:
+        self._page = page
+        self._selector = selector
+        self._nth: int | None = None
 
     @property
     def first(self) -> FakeLocator:
         return self
+
+    def locator(self, selector: str) -> FakeLocator:
+        self._page.locator_selectors.append(selector)
+        return FakeLocator(self._page, selector)
+
+    def nth(self, index: int) -> FakeLocator:
+        child = FakeLocator(self._page, self._selector)
+        child._nth = index
+        self._page.option_nth_calls.append(index)
+        return child
+
+    async def wait_for(self, *, state: str, timeout: int) -> None:
+        self._page.option_wait_calls.append({"state": state, "timeout": timeout})
+        if self._page.option_wait_error is not None:
+            raise self._page.option_wait_error
+
+    async def inner_text(self) -> str:
+        return self._page.selected_option_text
 
     async def select_option(
         self,
@@ -166,6 +228,13 @@ class FakeLocator:
         self._page.select_option_timeout = timeout
         if self._page.select_option_error is not None:
             raise self._page.select_option_error
+        if index == 1 and self._page._active_expect is not None:
+            if (
+                not self._page.skip_validate_request
+                and not self._page.stale_request_on_listen
+            ):
+                self._page.emit_validate_request()
+            self._page._active_expect._response = self._page.build_validate_response()
 
 
 class FakePage:
@@ -190,6 +259,19 @@ class FakePage:
         self.select_option_calls: list[int] = []
         self.select_option_timeout: int | None = None
         self.select_option_error: BaseException | None = None
+        self.option_nth_calls: list[int] = []
+        self.option_wait_calls: list[dict[str, object]] = []
+        self.option_wait_error: BaseException | None = None
+        self.selected_option_text = "Закордонний паспорт та (або) ID-картка"
+        self.expect_response_calls = 0
+        self.expect_response_timeout: int | None = None
+        self.expect_response_status = 200
+        self.expect_response_error: BaseException | None = None
+        self.skip_validate_request = False
+        self.stale_request_on_listen = False
+        self._request_listeners: list[object] = []
+        self._last_validate_request: FakeRequest | None = None
+        self._active_expect: FakeExpectResponse | None = None
         self.page_title = ""
         self.html = ""
         self.context: FakeContext | None = None
@@ -227,7 +309,45 @@ class FakePage:
 
     def locator(self, selector: str) -> FakeLocator:
         self.locator_selectors.append(selector)
-        return FakeLocator(self)
+        return FakeLocator(self, selector)
+
+    def on(self, event: str, handler: object) -> None:
+        if event != "request":
+            return
+        self._request_listeners.append(handler)
+        if self.stale_request_on_listen:
+            request = FakeRequest(url=self.url, resource_type="xhr")
+            self._last_validate_request = request
+            handler(request)  # type: ignore[operator]
+
+    def remove_listener(self, event: str, handler: object) -> None:
+        if event != "request":
+            return
+        if handler in self._request_listeners:
+            self._request_listeners.remove(handler)
+
+    def emit_validate_request(self) -> None:
+        request = FakeRequest(url=self.url, resource_type="xhr")
+        self._last_validate_request = request
+        for handler in list(self._request_listeners):
+            handler(request)  # type: ignore[operator]
+
+    def build_validate_response(self) -> FakeResponse:
+        request = self._last_validate_request or FakeRequest(
+            url=self.url, resource_type="xhr"
+        )
+        return FakeResponse(self.url, self.expect_response_status, request)
+
+    def expect_response(
+        self,
+        predicate: object,
+        *,
+        timeout: int,
+    ) -> FakeExpectResponse:
+        del predicate
+        self.expect_response_calls += 1
+        self.expect_response_timeout = timeout
+        return FakeExpectResponse(self)
 
     async def evaluate(self, script: str) -> dict[str, object]:
         if not script:
@@ -324,10 +444,6 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self._poll_patch = patch("src.services.scraper._DOM_POLL_SECONDS", 0)
         self._retry_patch = patch("src.services.scraper._CONTEXT_RETRY_SECONDS", 0)
         self._queue_wait_patch = patch("src.services.scraper._QUEUE_UI_WAIT_MS", 0)
-        self._settle_patch = patch(
-            "src.services.scraper._SERVICE_SELECT_SETTLE_SECONDS",
-            0,
-        )
         self._cf_hold_patch = patch(
             "src.services.scraper._CF_INTERSTITIAL_HOLD_SECONDS",
             0,
@@ -336,12 +452,10 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self._poll_patch.start()
         self._retry_patch.start()
         self._queue_wait_patch.start()
-        self._settle_patch.start()
         self._cf_hold_patch.start()
 
     async def asyncTearDown(self) -> None:
         self._cf_hold_patch.stop()
-        self._settle_patch.stop()
         self._queue_wait_patch.stop()
         self._retry_patch.stop()
         self._poll_patch.stop()
@@ -416,9 +530,14 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.reload_timeout, 15_000)
         self.assertEqual(page.wait_for_selector_calls, 1)
         self.assertEqual(page.wait_for_selector_selector, _QUEUE_UI_SELECTOR)
-        self.assertEqual(page.locator_selectors, ["select"])
-        self.assertEqual(page.select_option_calls, [1])
+        self.assertIn("select", page.locator_selectors)
+        self.assertIn("option", page.locator_selectors)
+        self.assertEqual(page.select_option_calls, [0, 1])
         self.assertEqual(page.select_option_timeout, 5_000)
+        self.assertEqual(page.option_wait_calls[0]["state"], "attached")
+        self.assertEqual(page.option_wait_calls[0]["timeout"], 10_000)
+        self.assertEqual(page.expect_response_calls, 1)
+        self.assertEqual(page.expect_response_timeout, 10_000)
         self.assertEqual(context.new_page_calls, 0)
         self.assertEqual(_QUEUE_UI_WAIT_MS, 20_000)
 
@@ -520,7 +639,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
         self.assertEqual(page.wait_for_selector_calls, 2)
-        self.assertEqual(page.select_option_calls, [1])
+        self.assertEqual(page.select_option_calls, [0, 1])
         self.assertEqual(page.reload_calls, 1)
 
     async def test_rate_limit_message_raises_typed_failure(self) -> None:
@@ -683,7 +802,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, SlotStatus.NO_SLOTS)
         self.assertEqual(page.reload_calls, 1)
-        self.assertEqual(page.select_option_calls, [1])
+        self.assertEqual(page.select_option_calls, [0, 1])
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.READY)
         self.assertIsNone(health.failure_code)
@@ -753,6 +872,81 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         result = await scraper.check_availability()
 
         self.assertEqual(result.status, SlotStatus.NO_SLOTS)
+
+    async def test_xhr_500_returns_server_error_without_dom_poll(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.expect_response_status = 500
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.failure_code, ScraperFailureCode.SERVER_ERROR)
+        self.assertEqual(page.select_option_calls, [0, 1])
+        self.assertEqual(page.expect_response_calls, 1)
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.failure_code, ScraperFailureCode.SERVER_ERROR)
+
+    async def test_xhr_429_raises_rate_limit(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.expect_response_status = 429
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        with self.assertRaises(RateLimitException):
+            await scraper.check_availability()
+
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)
+
+    async def test_xhr_4xx_returns_service_validate_error(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.expect_response_status = 404
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.failure_code, ScraperFailureCode.SERVICE_VALIDATE_ERROR)
+        self.assertEqual(page.select_option_calls, [0, 1])
+
+    async def test_stale_validate_response_is_inconclusive(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.stale_request_on_listen = True
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.failure_code, ScraperFailureCode.INCONCLUSIVE_PAGE)
+        self.assertEqual(result.details, "stale response matched")
+
+    async def test_missing_validate_request_is_inconclusive(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.skip_validate_request = True
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.failure_code, ScraperFailureCode.INCONCLUSIVE_PAGE)
+        self.assertEqual(result.details, "stale response matched")
+
+    async def test_validate_response_timeout_is_inconclusive(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.expect_response_error = PlaywrightTimeoutError("Timeout")
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.failure_code, ScraperFailureCode.INCONCLUSIVE_PAGE)
+        self.assertEqual(result.details, "service validation response timed out")
 
 
 if __name__ == "__main__":

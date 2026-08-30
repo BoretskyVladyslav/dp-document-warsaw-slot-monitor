@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from playwright.async_api import Browser, Page, Playwright
+from playwright.async_api import Browser, Locator, Page, Playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -48,9 +49,12 @@ _QUEUE_UI_WAIT_MS = 20_000
 _CONTEXT_RETRY_SECONDS = 3.0
 _DOM_POLL_SECONDS = 0.25
 _DOM_STABILITY_SECONDS = 3.0
-_SERVICE_SELECT_SETTLE_SECONDS = 3.0
 _SERVICE_SELECT_TIMEOUT_MS = 5_000
+_SERVICE_PLACEHOLDER_INDEX = 0
 _SERVICE_OPTION_INDEX = 1
+_SERVICE_OPTION_ATTACH_TIMEOUT_MS = 10_000
+_SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS = 10_000
+_SUSPICIOUS_VALIDATE_SECONDS = 0.2
 _CF_INTERSTITIAL_HOLD_SECONDS = 5.0
 _QUEUE_UI_SELECTOR = "select"
 
@@ -424,7 +428,9 @@ class SlotScraper:
         if immediate is not None:
             return immediate
         await self._wait_for_queue_ui(page)
-        await self._select_first_service(page)
+        select_result = await self._select_first_service(page)
+        if select_result is not None:
+            return select_result
         return await self._wait_for_decisive_evidence(page)
 
     async def _peek_terminal_page_state(self, page: Page) -> SlotCheckResult | None:
@@ -536,13 +542,10 @@ class SlotScraper:
                     return
                 raise
 
-    async def _select_first_service(self, page: Page) -> None:
+    async def _select_first_service(self, page: Page) -> SlotCheckResult | None:
         self._require_cdp_connected()
         try:
-            await page.locator("select").first.select_option(
-                index=_SERVICE_OPTION_INDEX,
-                timeout=_SERVICE_SELECT_TIMEOUT_MS,
-            )
+            return await self._select_first_service_attempt(page)
         except PlaywrightTimeoutError:
             logger.info(
                 "service_select_timeout",
@@ -552,7 +555,10 @@ class SlotScraper:
                     "option_index": _SERVICE_OPTION_INDEX,
                 },
             )
-            return
+            return self._unknown_result(
+                ScraperFailureCode.INCONCLUSIVE_PAGE,
+                "service select or option attach timed out",
+            )
         except PlaywrightError as exc:
             if is_target_closed_error(exc) or self._page_is_closed(page):
                 raise TargetTabClosedError(
@@ -571,10 +577,7 @@ class SlotScraper:
                     "target tab closed while selecting a service"
                 ) from exc
             try:
-                await page.locator("select").first.select_option(
-                    index=_SERVICE_OPTION_INDEX,
-                    timeout=_SERVICE_SELECT_TIMEOUT_MS,
-                )
+                return await self._select_first_service_attempt(page)
             except PlaywrightTimeoutError:
                 logger.info(
                     "service_select_timeout",
@@ -584,23 +587,133 @@ class SlotScraper:
                         "option_index": _SERVICE_OPTION_INDEX,
                     },
                 )
-                return
+                return self._unknown_result(
+                    ScraperFailureCode.INCONCLUSIVE_PAGE,
+                    "service select or option attach timed out",
+                )
             except PlaywrightError as retry_exc:
                 if is_target_closed_error(retry_exc) or self._page_is_closed(page):
                     raise TargetTabClosedError(
                         "target tab closed while selecting a service"
                     ) from retry_exc
                 if is_execution_context_destroyed(retry_exc):
-                    return
+                    return self._unknown_result(
+                        ScraperFailureCode.INCONCLUSIVE_PAGE,
+                        "service select context destroyed",
+                    )
                 raise
+
+    async def _select_first_service_attempt(self, page: Page) -> SlotCheckResult | None:
+        select = page.locator("select").first
+        await select.locator("option").nth(_SERVICE_OPTION_INDEX).wait_for(
+            state="attached",
+            timeout=_SERVICE_OPTION_ATTACH_TIMEOUT_MS,
+        )
+        await select.select_option(
+            index=_SERVICE_PLACEHOLDER_INDEX,
+            timeout=_SERVICE_SELECT_TIMEOUT_MS,
+        )
+        return await self._await_service_validation(page, select)
+
+    async def _await_service_validation(
+        self,
+        page: Page,
+        select: Locator,
+    ) -> SlotCheckResult | None:
+        parsed = urlparse(page.url)
+        page_origin = f"{parsed.scheme}://{parsed.netloc}"
+        request_started_at: dict[int, float] = {}
+
+        def _on_request(req: object) -> None:
+            resource_type = getattr(req, "resource_type", "")
+            request_url = str(getattr(req, "url", ""))
+            if resource_type in ("xhr", "fetch") and request_url.startswith(page_origin):
+                request_started_at[id(req)] = time.monotonic()
+
+        def _is_fresh_validate_response(response: object) -> bool:
+            request = getattr(response, "request", None)
+            resource_type = getattr(request, "resource_type", "")
+            response_url = str(getattr(response, "url", ""))
+            started_at = request_started_at.get(id(request))
+            return (
+                resource_type in ("xhr", "fetch")
+                and response_url.startswith(page_origin)
+                and started_at is not None
+                and started_at >= select_ts
+            )
+
+        page.on("request", _on_request)
+        select_ts = time.monotonic()
+        try:
+            try:
+                async with page.expect_response(
+                    _is_fresh_validate_response,
+                    timeout=_SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS,
+                ) as pending:
+                    await select.select_option(
+                        index=_SERVICE_OPTION_INDEX,
+                        timeout=_SERVICE_SELECT_TIMEOUT_MS,
+                    )
+                response = await pending.value
+            except PlaywrightTimeoutError:
+                logger.info(
+                    "service_validate_timeout",
+                    extra={
+                        "city": self._settings.city_name,
+                        "timeout_ms": _SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS,
+                    },
+                )
+                return self._unknown_result(
+                    ScraperFailureCode.INCONCLUSIVE_PAGE,
+                    "service validation response timed out",
+                )
+        finally:
+            page.remove_listener("request", _on_request)
+
+        elapsed = time.monotonic() - select_ts
+        captured_request_start = request_started_at.get(id(getattr(response, "request", None)))
+        if captured_request_start is None or captured_request_start < select_ts:
+            logger.warning(
+                "stale_validate_response",
+                extra={
+                    "city": self._settings.city_name,
+                    "response_url": str(getattr(response, "url", "")),
+                },
+            )
+            return self._unknown_result(
+                ScraperFailureCode.INCONCLUSIVE_PAGE,
+                "stale response matched",
+            )
+        status = int(getattr(response, "status", 0))
+        if status >= 500:
+            return await self._emit_server_error(page)
+        if status == 429:
+            raise RateLimitException("XHR Rate Limit")
+        if not bool(getattr(response, "ok", False)):
+            return self._unknown_result(
+                ScraperFailureCode.SERVICE_VALIDATE_ERROR,
+                "service validation rejected",
+            )
+        if elapsed < _SUSPICIOUS_VALIDATE_SECONDS:
+            logger.warning(
+                "suspiciously_fast_validate_response",
+                extra={
+                    "city": self._settings.city_name,
+                    "elapsed_ms": elapsed * 1000,
+                },
+            )
+        service_text = await select.locator("option").nth(
+            _SERVICE_OPTION_INDEX
+        ).inner_text()
         logger.info(
             "service_option_selected",
             extra={
                 "city": self._settings.city_name,
                 "option_index": _SERVICE_OPTION_INDEX,
+                "service_text": service_text.strip(),
             },
         )
-        await asyncio.sleep(_SERVICE_SELECT_SETTLE_SECONDS)
+        return None
 
     async def _probe_latched_page(self, page: Page) -> SlotCheckResult:
         self._require_cdp_connected()
@@ -615,7 +728,18 @@ class SlotScraper:
         if has_server_error_page(evidence):
             return await self._emit_server_error(page)
         if evidence.service_select_visible:
-            await self._select_first_service(page)
+            select_result = await self._select_first_service(page)
+            if select_result is not None:
+                if select_result.failure_code is ScraperFailureCode.INCONCLUSIVE_PAGE:
+                    self._latched_failure = latched_failure
+                    self._set_health(
+                        status=ScraperHealthStatus.NEEDS_HUMAN,
+                        cdp_connected=True,
+                        target_tab_present=True,
+                        failure_code=latched_failure,
+                        details=latched_details,
+                    )
+                return select_result
         result = await self._wait_for_decisive_evidence(page)
         if result.status is SlotStatus.UNKNOWN:
             if result.failure_code is ScraperFailureCode.INCONCLUSIVE_PAGE:
