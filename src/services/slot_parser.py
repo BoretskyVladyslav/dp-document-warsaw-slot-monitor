@@ -14,6 +14,11 @@ OCCUPIED_INSTRUCTION = "будь ласка, спробуйте в інший ч
 SERVICE_LABEL = "послуга"
 SELECT_PLACEHOLDER = "- обрати -"
 RATE_LIMIT_MESSAGE = "too many requests, please try again later"
+_SERVER_ERROR_MARKERS: tuple[str, ...] = (
+    "datetimezone::__construct",
+    "500 internal server error",
+    "виникла помилка при обробці вашого запиту",
+)
 
 _CF_TITLE_MARKERS: tuple[str, ...] = (
     "just a moment",
@@ -56,6 +61,16 @@ def has_rate_limit_message(evidence: SlotPageEvidence) -> bool:
     return RATE_LIMIT_MESSAGE in normalize_visible_text(evidence.visible_text)
 
 
+def has_server_error_page(evidence: SlotPageEvidence) -> bool:
+    haystack = " ".join(
+        (
+            normalize_visible_text(evidence.title),
+            normalize_visible_text(evidence.visible_text),
+        )
+    )
+    return any(marker in haystack for marker in _SERVER_ERROR_MARKERS)
+
+
 def classify_slot_evidence(
     evidence: SlotPageEvidence,
     *,
@@ -69,6 +84,14 @@ def classify_slot_evidence(
             error=ScraperFailureCode.CLOUDFLARE_CHALLENGE.value,
             failure_code=ScraperFailureCode.CLOUDFLARE_CHALLENGE,
             details="Cloudflare challenge page detected",
+        )
+    if has_server_error_page(evidence):
+        return SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=moment,
+            error=ScraperFailureCode.SERVER_ERROR.value,
+            failure_code=ScraperFailureCode.SERVER_ERROR,
+            details="site_backend_error",
         )
 
     visible_text = normalize_visible_text(evidence.visible_text)

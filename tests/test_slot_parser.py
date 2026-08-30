@@ -9,6 +9,7 @@ from src.services.slot_parser import (
     SlotPageEvidence,
     classify_slot_evidence,
     has_rate_limit_message,
+    has_server_error_page,
     normalize_visible_text,
 )
 
@@ -192,6 +193,23 @@ def test_rate_limit_message_is_detected_case_insensitively() -> None:
     assert has_rate_limit_message(
         evidence(visible_text="TOO MANY REQUESTS,\nplease try again later")
     )
+
+
+@pytest.mark.parametrize(
+    "visible_text",
+    [
+        "DateTimeZone::__construct(): Unknown or bad timezone ()",
+        "500 Internal Server Error",
+        "Виникла помилка при обробці вашого запиту",
+    ],
+)
+def test_backend_error_pages_are_transient_server_error(visible_text: str) -> None:
+    page = evidence(visible_text=visible_text)
+    assert has_server_error_page(page)
+    result = classify_slot_evidence(page, checked_at=CHECKED_AT)
+    assert result.status is SlotStatus.UNKNOWN
+    assert result.failure_code is ScraperFailureCode.SERVER_ERROR
+    assert result.details == "site_backend_error"
 
 
 def test_normalizer_casefolds_whitespace_and_dash_variants() -> None:

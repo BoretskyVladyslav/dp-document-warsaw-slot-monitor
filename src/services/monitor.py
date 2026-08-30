@@ -276,19 +276,20 @@ class SlotMonitor:
                     )
 
         self._last_result = result
-        logger.info(
-            "slot_check",
-            extra={
-                "city": self._settings.city_name,
-                "status": result.status.value,
-                "error": result.error,
-                "failure_code": (
-                    result.failure_code.value
-                    if result.failure_code is not None
-                    else None
-                ),
-            },
-        )
+        log_extra = {
+            "city": self._settings.city_name,
+            "status": result.status.value,
+            "error": result.error,
+            "failure_code": (
+                result.failure_code.value
+                if result.failure_code is not None
+                else None
+            ),
+        }
+        if result.failure_code is ScraperFailureCode.SERVER_ERROR:
+            logger.warning("site_backend_error", extra=log_extra)
+        else:
+            logger.info("slot_check", extra=log_extra)
         await self._notifier.drain_outbox()
         return result
 

@@ -94,7 +94,7 @@ Only visible DOM evidence is authoritative:
 
 - `NO_SLOTS`: the complete Ukrainian occupied banner is visible.
 - `FREE_SLOTS_AVAILABLE`: the visible service select contains `- Обрати -` and a visible `input[type="tel"]` exists.
-- `UNKNOWN`: evidence is partial, contradictory, challenged, disconnected, timed out, or otherwise inconclusive.
+- `UNKNOWN`: evidence is partial, contradictory, challenged, disconnected, timed out, a transient site backend error, or otherwise inconclusive.
 
 The final visible state must remain stable before it is accepted. `UNKNOWN` never creates a slot alert and never overwrites the last verified business state.
 
@@ -107,6 +107,7 @@ Missing tabs, closed tabs, CDP disconnects, and Cloudflare challenges create a p
 - Open or refresh the exact target tab and complete the challenge manually.
 - A successful visible-state verification clears the incident and resumes normal soft reloads.
 - A visible `Too many requests` response starts a persistent 15-minute cooldown. Scheduled and manual checks respect it without reloading the page.
+- PHP/Joomla backend error pages (`DateTimeZone::__construct`, HTTP 500, Ukrainian request-processing errors) are transient `server_error` results: the monitor logs a warning and retries on the next cycle without a human-action alert.
 
 ## Telegram commands
 

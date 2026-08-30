@@ -426,6 +426,31 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
         self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)
 
+    async def test_backend_error_page_is_degraded_not_human_action(self) -> None:
+        raw = free_evidence()
+        raw.update(
+            {
+                "visibleText": (
+                    "DateTimeZone::__construct(): Unknown or bad timezone ()"
+                ),
+                "serviceSelectVisible": False,
+                "selectPlaceholderVisible": False,
+                "telInputVisible": False,
+            }
+        )
+        page = FakePage(TARGET_URL, raw)
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.UNKNOWN)
+        self.assertEqual(result.failure_code, ScraperFailureCode.SERVER_ERROR)
+        self.assertEqual(result.details, "site_backend_error")
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
+        self.assertEqual(health.failure_code, ScraperFailureCode.SERVER_ERROR)
+
     async def test_human_refresh_clears_latch_without_worker_reload(self) -> None:
         page = FakePage(TARGET_URL, challenge_evidence())
         scraper = SlotScraper(settings())

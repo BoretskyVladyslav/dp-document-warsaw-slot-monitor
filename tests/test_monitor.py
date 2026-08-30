@@ -199,6 +199,29 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.last_error, "inconclusive_page")
         self.assertEqual(notifier.verified, [])
 
+    async def test_backend_error_persists_attempt_without_human_alert(self) -> None:
+        result = SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=self.checked_at,
+            details="site_backend_error",
+            error="server_error",
+            failure_code=ScraperFailureCode.SERVER_ERROR,
+        )
+        scraper = BlockingScraper(result=result)
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+        scraper.release.set()
+
+        returned = await monitor.run_once()
+        state = await get_monitor_state(self.db.connection, "warsaw")
+
+        self.assertIs(returned, result)
+        assert state is not None
+        self.assertEqual(state.last_error, "server_error")
+        self.assertEqual(notifier.incidents, [])
+        self.assertEqual(notifier.verified, [])
+        self.assertEqual(notifier.drain_calls, 1)
+
     async def test_rate_limit_starts_cooldown_and_manual_check_respects_it(
         self,
     ) -> None:

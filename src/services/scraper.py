@@ -509,6 +509,11 @@ class SlotScraper:
                 continue
             challenge_since = None
             last_result = classify_slot_evidence(evidence)
+            if last_result.failure_code is ScraperFailureCode.SERVER_ERROR:
+                return self._unknown_result(
+                    ScraperFailureCode.SERVER_ERROR,
+                    last_result.details,
+                )
             if last_result.status is not SlotStatus.UNKNOWN:
                 if candidate_status is not last_result.status:
                     candidate_status = last_result.status
