@@ -646,7 +646,8 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         incomplete["serviceOptionSelected"] = False
         incomplete["serviceSelectVisible"] = False
         page.evidence = incomplete
-        result = await scraper.check_availability()
+        with patch("src.services.scraper._DOM_SIGNAL_TIMEOUT_MS", 0):
+            result = await scraper.check_availability()
 
         self.assertEqual(result.status, SlotStatus.UNKNOWN)
         health = await scraper.get_health_snapshot()
@@ -656,6 +657,36 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             health.failure_code,
             ScraperFailureCode.CLOUDFLARE_CHALLENGE,
         )
+
+    async def test_latched_probe_waits_for_occupied_banner_after_select(self) -> None:
+        occupied = free_evidence()
+        occupied.update(
+            {
+                "visibleText": "Вибачте, на даний момент всі місця зайняті!",
+                "occupiedBannerVisible": True,
+            }
+        )
+        page = FakePage(TARGET_URL, challenge_evidence())
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
+
+        page.evidence_sequence = [
+            free_evidence(),
+            free_evidence(),
+            occupied,
+            occupied,
+        ]
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.NO_SLOTS)
+        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.select_option_calls, [1])
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.READY)
+        self.assertIsNone(health.failure_code)
 
     async def test_closed_tab_during_reload_is_typed_and_latched(self) -> None:
         page = FakePage(TARGET_URL)

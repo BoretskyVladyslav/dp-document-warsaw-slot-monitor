@@ -604,6 +604,8 @@ class SlotScraper:
 
     async def _probe_latched_page(self, page: Page) -> SlotCheckResult:
         self._require_cdp_connected()
+        latched_failure = self._latched_failure
+        latched_details = self._health.details
         evidence = await collect_dom_evidence(page)
         self._raise_if_rate_limited(evidence)
         if has_cloudflare_challenge(evidence):
@@ -614,17 +616,18 @@ class SlotScraper:
             return await self._emit_server_error(page)
         if evidence.service_select_visible:
             await self._select_first_service(page)
-            evidence = await collect_dom_evidence(page)
-            self._raise_if_rate_limited(evidence)
-        result = classify_slot_evidence(evidence)
+        result = await self._wait_for_decisive_evidence(page)
         if result.status is SlotStatus.UNKNOWN:
+            if result.failure_code is ScraperFailureCode.INCONCLUSIVE_PAGE:
+                self._latched_failure = latched_failure
+                self._set_health(
+                    status=ScraperHealthStatus.NEEDS_HUMAN,
+                    cdp_connected=True,
+                    target_tab_present=True,
+                    failure_code=latched_failure,
+                    details=latched_details,
+                )
             return result
-        self._latched_failure = None
-        self._set_health(
-            status=ScraperHealthStatus.READY,
-            cdp_connected=True,
-            target_tab_present=True,
-        )
         logger.info(
             "scraper_human_action_recovered",
             extra={"city": self._settings.city_name},
