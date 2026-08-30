@@ -191,6 +191,20 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42])
         self.assertIn("cloudflare_challenge", self.sender.sent[0][1])
 
+    async def test_ukrainian_cloudflare_challenge_still_alerts_admin(self) -> None:
+        failure = CloudflareChallengeError(
+            "Cloudflare challenge page detected"
+        )
+        notified = await self.notifier.handle_human_action_required(
+            failure,
+            attempted_at=self.checked_at,
+        )
+        await self.notifier.drain_outbox()
+
+        self.assertTrue(notified)
+        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42])
+        self.assertIn("cloudflare_challenge", self.sender.sent[0][1])
+
     async def test_successful_verification_clears_incident_for_future_alert(self) -> None:
         failure = CdpUnavailableError("CDP offline")
         await self.notifier.handle_human_action_required(
@@ -270,7 +284,7 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary.delivered, 0)
         self.assertEqual(self.sender.sent, [])
 
-    async def test_server_error_alert_is_admin_only_and_latched(self) -> None:
+    async def test_server_error_does_not_send_telegram(self) -> None:
         result = SlotCheckResult(
             status=SlotStatus.UNKNOWN,
             checked_at=self.checked_at,
@@ -278,23 +292,16 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
             error="server_error",
             failure_code=ScraperFailureCode.SERVER_ERROR,
         )
-        first = await self.notifier.handle_server_error(result)
-        repeated = await self.notifier.handle_server_error(
-            SlotCheckResult(
-                status=SlotStatus.UNKNOWN,
-                checked_at=self.checked_at + timedelta(minutes=3),
-                details="site_backend_error",
-                error="server_error",
-                failure_code=ScraperFailureCode.SERVER_ERROR,
-            )
-        )
+        notified = await self.notifier.handle_server_error(result)
         await self.notifier.drain_outbox()
 
-        self.assertTrue(first)
-        self.assertFalse(repeated)
-        self.assertEqual([chat_id for chat_id, _ in self.sender.sent], [42])
-        self.assertIn("site_backend_error", self.sender.sent[0][1])
-        self.assertIn("Cookies", self.sender.sent[0][1])
+        self.assertFalse(notified)
+        self.assertEqual(self.sender.sent, [])
+        pending = await list_pending_deliveries(
+            self.db.connection,
+            city_key="warsaw",
+        )
+        self.assertEqual(pending, [])
 
     async def test_circuit_breaker_alert_is_admin_only(self) -> None:
         await self.notifier.handle_circuit_breaker(

@@ -251,7 +251,9 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.last_error, "inconclusive_page")
         self.assertEqual(notifier.verified, [])
 
-    async def test_backend_error_alerts_admin_once_per_latch(self) -> None:
+    async def test_backend_error_persists_and_notifies_service_without_slots_alert(
+        self,
+    ) -> None:
         result = SlotCheckResult(
             status=SlotStatus.UNKNOWN,
             checked_at=self.checked_at,

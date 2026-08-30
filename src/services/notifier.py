@@ -123,16 +123,6 @@ def format_human_action_required(
     )
 
 
-def format_server_error_alert(*, city_name: str, target_url: str) -> str:
-    return (
-        f"⚠️ Backend crash — {city_name}\n\n"
-        "Причина: site_backend_error (PHP/Joomla 500 / DateTimeZone)\n"
-        "Cookies for the target tab were cleared automatically.\n"
-        "The monitor will retry on the next cycle without human intervention.\n\n"
-        f"URL: {target_url}"
-    )
-
-
 def format_circuit_breaker_alert(
     *,
     city_name: str,
@@ -276,31 +266,15 @@ class Notifier:
         return is_new
 
     async def handle_server_error(self, result: SlotCheckResult) -> bool:
-        recipients = [
-            NotificationRecipient(chat_id=admin_id)
-            for admin_id in self._admin_ids
-        ]
-        is_new, event_id = await persist_human_action_incident(
-            self._database,
-            city_key=self._city_key,
-            failure_code=ScraperFailureCode.SERVER_ERROR,
-            attempted_at=result.checked_at,
-            details=result.details or "site_backend_error",
-            notification_text=format_server_error_alert(
-                city_name=self._city_name,
-                target_url=self._target_url,
-            ),
-            recipients=recipients,
-        )
         logger.warning(
-            "server_error_incident_recorded",
+            "site_backend_error_telegram_muted",
             extra={
                 "city": self._city_name,
-                "new_incident": is_new,
-                "event_id": event_id,
+                "details": result.details,
+                "error": result.error,
             },
         )
-        return is_new
+        return False
 
     async def handle_circuit_breaker(
         self,
