@@ -34,6 +34,7 @@ from src.services.slot_parser import (
     SlotPageEvidence,
     classify_slot_evidence,
     has_cloudflare_challenge,
+    has_cloudflare_source,
     has_rate_limit_message,
     has_server_error_page,
     has_server_error_source,
@@ -95,7 +96,10 @@ _DOM_EVIDENCE_SCRIPT = f"""
   ).some(isVisible);
   const challengeVisible = Array.from(document.querySelectorAll(
     "#challenge-running, #challenge-platform, #cf-spinner, .cf-browser-verification"
-  )).some(isVisible);
+  )).some(isVisible)
+    || Array.from(document.querySelectorAll("iframe")).some((iframe) =>
+      String(iframe.getAttribute("src") || "").includes("cf-chl-widget")
+    );
 
   return {{
     title: document.title || "",
@@ -418,9 +422,15 @@ class SlotScraper:
 
     async def _peek_terminal_page_state(self, page: Page) -> SlotCheckResult | None:
         self._require_cdp_connected()
-        source_error = await self._server_error_from_page_source(page)
-        if source_error is not None:
-            return source_error
+        source = await self._read_page_source(page)
+        if source is not None:
+            title, html = source
+            if has_cloudflare_source(title=title, html=html):
+                raise CloudflareChallengeError(
+                    "Cloudflare challenge page detected"
+                )
+            if has_server_error_source(title=title, html=html):
+                return await self._emit_server_error(page)
         try:
             evidence = await collect_dom_evidence(page)
         except PlaywrightError as exc:
@@ -432,10 +442,7 @@ class SlotScraper:
             return await self._emit_server_error(page)
         return None
 
-    async def _server_error_from_page_source(
-        self,
-        page: Page,
-    ) -> SlotCheckResult | None:
+    async def _read_page_source(self, page: Page) -> tuple[str, str] | None:
         try:
             title = await page.title()
             html = await page.content()
@@ -451,9 +458,7 @@ class SlotScraper:
                 )
                 return None
             raise
-        if has_server_error_source(title=title, html=html):
-            return await self._emit_server_error(page)
-        return None
+        return title, html
 
     async def _emit_server_error(self, page: Page) -> SlotCheckResult:
         await self._clear_target_cookies(page)

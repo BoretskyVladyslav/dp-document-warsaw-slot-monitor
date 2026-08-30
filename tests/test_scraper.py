@@ -401,6 +401,41 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ScraperFailureCode.CLOUDFLARE_CHALLENGE,
         )
 
+    async def test_ukrainian_turnstile_fails_before_queue_ui_wait(self) -> None:
+        raw = {
+            "title": "Трохи зачекайте...",
+            "url": TARGET_URL,
+            "visibleText": "Триває перевірка безпеки. Підтвердьте, що ви людина.",
+            "occupiedBannerVisible": False,
+            "serviceSelectVisible": False,
+            "selectPlaceholderVisible": False,
+            "telInputVisible": False,
+            "challengeVisible": False,
+        }
+        page = FakePage(TARGET_URL, raw)
+        page.html = (
+            "<p>Триває перевірка безпеки</p>"
+            '<iframe src="https://challenges.cloudflare.com/'
+            'cdn-cgi/challenge-platform/h/b/cf-chl-widget/abc"></iframe>'
+        )
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
+
+        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.wait_for_selector_calls, 0)
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.NEEDS_HUMAN)
+        self.assertEqual(
+            health.failure_code,
+            ScraperFailureCode.CLOUDFLARE_CHALLENGE,
+        )
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
+        self.assertEqual(page.reload_calls, 1)
+
     async def test_transient_cloudflare_interstitial_does_not_latch(self) -> None:
         page = FakePage(TARGET_URL)
         page.evidence_sequence = [

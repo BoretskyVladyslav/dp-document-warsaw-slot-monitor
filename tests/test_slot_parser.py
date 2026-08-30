@@ -8,6 +8,7 @@ from src.core.models import ScraperFailureCode, SlotStatus
 from src.services.slot_parser import (
     SlotPageEvidence,
     classify_slot_evidence,
+    has_cloudflare_source,
     has_rate_limit_message,
     has_server_error_page,
     has_server_error_source,
@@ -158,6 +159,9 @@ def test_conflicting_visible_states_are_unknown() -> None:
             )
         ),
         evidence(challenge_visible=True),
+        evidence(title="Трохи зачекайте..."),
+        evidence(visible_text="Триває перевірка безпеки"),
+        evidence(visible_text="Підтвердьте, що ви людина"),
     ],
 )
 def test_cloudflare_signals_are_unknown(
@@ -170,6 +174,14 @@ def test_cloudflare_signals_are_unknown(
 
     assert result.status is SlotStatus.UNKNOWN
     assert result.failure_code is ScraperFailureCode.CLOUDFLARE_CHALLENGE
+
+
+def test_ukrainian_turnstile_iframe_is_detected_in_html() -> None:
+    assert has_cloudflare_source(
+        title="Електронна черга",
+        html='<iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/cf-chl-widget/abc"></iframe>',
+    )
+    assert has_cloudflare_source(title="Трохи зачекайте...")
 
 
 def test_stale_cloudflare_query_token_does_not_override_visible_form() -> None:
