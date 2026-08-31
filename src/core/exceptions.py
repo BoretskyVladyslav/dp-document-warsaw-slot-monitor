@@ -58,7 +58,7 @@ class RateLimitException(ScraperError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
-        self.failure_code = ScraperFailureCode.RATE_LIMITED
+        self.failure_code = ScraperFailureCode.TOO_MANY_REQUESTS
 
 
 class NetworkTimeoutError(ScraperError):

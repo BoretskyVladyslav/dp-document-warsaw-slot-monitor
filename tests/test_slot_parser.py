@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from src.core.models import ScraperFailureCode, SlotStatus
+from src.core.models import ScraperFailureCode, SlotStatus, is_rate_limit_failure
 from src.services.slot_parser import (
     SlotPageEvidence,
     TOO_MANY_REQUESTS_PHRASE,
@@ -260,9 +260,13 @@ def test_rate_limit_banner_classifies_as_rate_limited_not_inconclusive() -> None
     )
 
     assert result.status is SlotStatus.UNKNOWN
-    assert result.failure_code is ScraperFailureCode.RATE_LIMITED
-    assert result.error == "rate_limited"
+    assert result.failure_code is ScraperFailureCode.TOO_MANY_REQUESTS
+    assert result.error == "too_many_requests"
     assert result.details == "too_many_requests"
+    assert is_rate_limit_failure(result.failure_code)
+    assert is_rate_limit_failure("too_many_requests")
+    assert is_rate_limit_failure(ScraperFailureCode.RATE_LIMITED)
+    assert not is_rate_limit_failure(ScraperFailureCode.SERVER_ERROR)
 
 
 @pytest.mark.parametrize(

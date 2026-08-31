@@ -26,6 +26,7 @@ from src.core.models import (
     ScraperHealthStatus,
     SlotCheckResult,
     SlotStatus,
+    is_rate_limit_failure,
 )
 from src.services.slot_parser import (
     CF_BODY_MARKERS,
@@ -1001,7 +1002,7 @@ class SlotScraper:
                 continue
             challenge_since = None
             last_result = classify_slot_evidence(evidence)
-            if last_result.failure_code is ScraperFailureCode.RATE_LIMITED:
+            if is_rate_limit_failure(last_result.failure_code):
                 await self._raise_rate_limit(page, source="classified_evidence")
             if last_result.failure_code is ScraperFailureCode.SERVER_ERROR:
                 return await self._emit_server_error(page)
@@ -1048,7 +1049,7 @@ class SlotScraper:
             extra={
                 "city": self._settings.city_name,
                 "source": source,
-                "failure_code": ScraperFailureCode.RATE_LIMITED.value,
+                "failure_code": ScraperFailureCode.TOO_MANY_REQUESTS.value,
             },
         )
         await self._prepare_rate_limit_recovery(page)

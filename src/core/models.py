@@ -22,7 +22,23 @@ class ScraperFailureCode(StrEnum):
     SERVICE_VALIDATE_ERROR = "service_validate_error"
     SERVER_ERROR = "server_error"
     RATE_LIMITED = "rate_limited"
+    TOO_MANY_REQUESTS = "too_many_requests"
     SCRAPER_ERROR = "scraper_error"
+
+
+_RATE_LIMIT_FAILURE_VALUES = frozenset(
+    {
+        "rate_limited",
+        "too_many_requests",
+    }
+)
+
+
+def is_rate_limit_failure(code: ScraperFailureCode | str | None) -> bool:
+    if code is None:
+        return False
+    value = code.value if isinstance(code, ScraperFailureCode) else code
+    return value in _RATE_LIMIT_FAILURE_VALUES
 
 
 class ScraperHealthStatus(StrEnum):

@@ -46,6 +46,20 @@ Optional settings:
 
 Never commit `.env`.
 
+## Quick start (Windows)
+
+Double-click these files from the project folder:
+
+1. `setup.bat` — installs Python packages, Playwright Chromium, and copies `.env.example` to `.env` if needed.
+2. Edit `.env` and set `BOT_TOKEN` (and confirm `ADMIN_IDS`).
+3. `START_BOT.bat` — starts dedicated CDP Chrome, waits 3 seconds, then runs the bot.
+
+Complete any Cloudflare challenge in the Chrome tab that opens. Leave that Chrome window and tab open while the bot is running.
+
+If `setup.bat` reports that Python is missing, install Python from python.org and enable **Add python.exe to PATH**.
+
+Manual commands below remain available for diagnostics.
+
 ## Installation
 
 ```powershell

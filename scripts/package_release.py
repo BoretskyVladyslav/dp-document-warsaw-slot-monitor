@@ -25,6 +25,7 @@ _EXCLUDED_DIR_NAMES = frozenset(
 )
 _EXCLUDED_SUFFIXES = frozenset({".pyc", ".sqlite3", ".db", ".log"})
 _EXCLUDED_FILE_NAMES = frozenset({".env", "dp_document_bot.zip"})
+_REQUIRED_ROOT_FILES = frozenset({"setup.bat", "START_BOT.bat", ".env.example"})
 
 
 def should_exclude(path: Path, *, root: Path) -> bool:
@@ -54,11 +55,18 @@ def iter_release_files(root: Path) -> list[Path]:
 
 
 def build_release_zip(root: Path, output: Path) -> Path:
+    files = iter_release_files(root)
+    relative_names = {path.relative_to(root).as_posix() for path in files}
+    missing = sorted(name for name in _REQUIRED_ROOT_FILES if name not in relative_names)
+    if missing:
+        raise FileNotFoundError(
+            "release archive is missing required files: " + ", ".join(missing)
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         output.unlink()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in iter_release_files(root):
+        for path in files:
             archive_name = Path(_ARCHIVE_ROOT) / path.relative_to(root)
             archive.write(path, arcname=archive_name.as_posix())
     return output

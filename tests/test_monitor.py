@@ -357,8 +357,8 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         detected = await monitor.run_once()
         skipped = await monitor.check_now(admin_id=1)
 
-        self.assertEqual(detected.failure_code, ScraperFailureCode.RATE_LIMITED)
-        self.assertEqual(skipped.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(detected.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
+        self.assertEqual(skipped.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
         self.assertIn("seconds remaining", skipped.details)
         self.assertEqual(scraper.calls, 1)
         self.assertEqual(len(notifier.rate_limits), 1)
@@ -392,7 +392,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         await monitor.restore_state()
         skipped = await monitor.run_once()
 
-        self.assertEqual(skipped.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(skipped.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
         self.assertIn("seconds remaining", skipped.details)
         self.assertEqual(scraper.calls, 0)
         self.assertEqual(scraper.arm_hard_reload_calls, 1)
@@ -453,11 +453,33 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         detected = await monitor.check_now(admin_id=1)
         skipped = await monitor.run_once()
 
-        self.assertEqual(detected.failure_code, ScraperFailureCode.RATE_LIMITED)
-        self.assertEqual(skipped.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(detected.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
+        self.assertEqual(skipped.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
         self.assertEqual(scraper.calls, 1)
         self.assertEqual(len(notifier.rate_limits), 1)
         self.assertEqual(notifier.drain_calls, 2)
+
+    async def test_returned_too_many_requests_enters_cooldown(self) -> None:
+        scraper = BlockingScraper(
+            result=SlotCheckResult(
+                status=SlotStatus.UNKNOWN,
+                checked_at=self.checked_at,
+                details="too_many_requests",
+                error="too_many_requests",
+                failure_code=ScraperFailureCode.TOO_MANY_REQUESTS,
+            )
+        )
+        notifier = FakeNotifier()
+        monitor = self._monitor(scraper, notifier)
+        scraper.release.set()
+
+        detected = await monitor.run_once()
+        skipped = await monitor.run_once()
+
+        self.assertEqual(detected.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
+        self.assertEqual(skipped.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
+        self.assertEqual(scraper.calls, 1)
+        self.assertEqual(len(notifier.rate_limits), 1)
 
     async def test_consecutive_rate_limits_escalate_cooldown(self) -> None:
         scraper = BlockingScraper(
@@ -475,7 +497,7 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 result.failure_code,
-                ScraperFailureCode.RATE_LIMITED,
+                ScraperFailureCode.TOO_MANY_REQUESTS,
             )
             self.assertEqual(
                 (cooldown_until - attempted_at).total_seconds(),

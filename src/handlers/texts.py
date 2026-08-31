@@ -4,9 +4,9 @@ from datetime import timedelta
 
 from src.core.models import (
     MonitorSnapshot,
-    ScraperFailureCode,
     SlotCheckResult,
     SlotStatus,
+    is_rate_limit_failure,
 )
 
 RATE_LIMIT_PAUSE_TEXT = (
@@ -101,8 +101,8 @@ def format_check_result(result: SlotCheckResult) -> str:
     error = f"\nПомилка: {result.error}" if result.error else ""
     rate_limit = ""
     if (
-        result.failure_code is ScraperFailureCode.RATE_LIMITED
-        or result.error == ScraperFailureCode.RATE_LIMITED.value
+        is_rate_limit_failure(result.failure_code)
+        or is_rate_limit_failure(result.error)
     ):
         rate_limit = f"\n{RATE_LIMIT_PAUSE_TEXT}"
     return (
@@ -120,11 +120,6 @@ def format_admin_only() -> str:
 
 
 def _is_rate_limited(snapshot: MonitorSnapshot) -> bool:
-    health = snapshot.scraper_health
-    if snapshot.last_error == ScraperFailureCode.RATE_LIMITED.value:
-        return True
-    if health is not None and health.failure_code is ScraperFailureCode.RATE_LIMITED:
-        return True
     return snapshot.cooldown_until is not None
 
 

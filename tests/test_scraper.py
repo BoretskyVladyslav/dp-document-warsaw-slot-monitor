@@ -886,7 +886,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.clear_cookies_calls, 1)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
-        self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(health.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
 
     async def test_rate_limit_hard_reloads_on_next_cycle(self) -> None:
         raw = free_evidence()
@@ -1211,7 +1211,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         health = await scraper.get_health_snapshot()
-        self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(health.failure_code, ScraperFailureCode.TOO_MANY_REQUESTS)
         self.assertEqual(page.context.clear_cookies_calls, 1)
 
     async def test_xhr_4xx_returns_service_validate_error(self) -> None:

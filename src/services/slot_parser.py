@@ -150,8 +150,8 @@ def classify_slot_evidence(
         return SlotCheckResult(
             status=SlotStatus.UNKNOWN,
             checked_at=moment,
-            error=ScraperFailureCode.RATE_LIMITED.value,
-            failure_code=ScraperFailureCode.RATE_LIMITED,
+            error=ScraperFailureCode.TOO_MANY_REQUESTS.value,
+            failure_code=ScraperFailureCode.TOO_MANY_REQUESTS,
             details="too_many_requests",
         )
     if has_server_error_page(evidence):

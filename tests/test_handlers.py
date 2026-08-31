@@ -91,7 +91,7 @@ class StatusFormattingTests(unittest.TestCase):
             last_check_at=checked_at,
             slot_state=SlotStatus.UNKNOWN,
             last_details="too_many_requests",
-            last_error="rate_limited",
+            last_error="too_many_requests",
             active_subscribers=12,
             uptime_seconds=3600,
             city_name="Warsaw",
@@ -103,7 +103,7 @@ class StatusFormattingTests(unittest.TestCase):
                 cdp_connected=True,
                 target_tab_present=True,
                 updated_at=checked_at,  # type: ignore[arg-type]
-                failure_code=ScraperFailureCode.RATE_LIMITED,
+                failure_code=ScraperFailureCode.TOO_MANY_REQUESTS,
                 details="too_many_requests",
             ),
             cooldown_until=checked_at,
@@ -114,7 +114,35 @@ class StatusFormattingTests(unittest.TestCase):
 
         self.assertIn(RATE_LIMIT_PAUSE_TEXT, public)
         self.assertIn(RATE_LIMIT_PAUSE_TEXT, admin)
-        self.assertIn("rate_limited", admin)
+        self.assertIn("too_many_requests", admin)
+
+    def test_status_hides_rate_limit_pause_after_cooldown(self) -> None:
+        checked_at = self.snapshot.last_attempt_at
+        snapshot = MonitorSnapshot(
+            last_check_at=checked_at,
+            slot_state=SlotStatus.UNKNOWN,
+            last_details="too_many_requests",
+            last_error="too_many_requests",
+            active_subscribers=12,
+            uptime_seconds=3600,
+            city_name="Warsaw",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            last_attempt_at=checked_at,
+            last_verified_at=checked_at,
+            scraper_health=ScraperHealthSnapshot(
+                status=ScraperHealthStatus.DEGRADED,
+                cdp_connected=True,
+                target_tab_present=True,
+                updated_at=checked_at,  # type: ignore[arg-type]
+                failure_code=ScraperFailureCode.TOO_MANY_REQUESTS,
+                details="too_many_requests",
+            ),
+            cooldown_until=None,
+        )
+
+        text = format_status(snapshot, is_admin=True)
+
+        self.assertNotIn(RATE_LIMIT_PAUSE_TEXT, text)
 
     def test_manual_check_result_includes_unknown_error(self) -> None:
         text = format_check_result(
@@ -135,13 +163,13 @@ class StatusFormattingTests(unittest.TestCase):
                 status=SlotStatus.UNKNOWN,
                 checked_at=self.snapshot.last_attempt_at,  # type: ignore[arg-type]
                 details="too_many_requests",
-                error="rate_limited",
-                failure_code=ScraperFailureCode.RATE_LIMITED,
+                error="too_many_requests",
+                failure_code=ScraperFailureCode.TOO_MANY_REQUESTS,
             )
         )
 
         self.assertIn(RATE_LIMIT_PAUSE_TEXT, text)
-        self.assertIn("rate_limited", text)
+        self.assertIn("too_many_requests", text)
 
 
 class HandlerAccessTests(unittest.IsolatedAsyncioTestCase):

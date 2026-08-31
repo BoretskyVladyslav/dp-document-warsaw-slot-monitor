@@ -16,6 +16,7 @@ from src.core.models import (
     ScraperFailureCode,
     SlotCheckResult,
     SlotStatus,
+    is_rate_limit_failure,
 )
 from src.database.connection import Database
 from src.database.monitor_state import get_monitor_state, record_check_attempt
@@ -276,40 +277,7 @@ class SlotMonitor:
         try:
             result = await self._scraper.check_availability()
         except RateLimitException as exc:
-            self._consecutive_rate_limits += 1
-            cooldown_seconds = _rate_limit_cooldown_seconds(
-                self._consecutive_rate_limits
-            )
-            checked_at = datetime.now(timezone.utc)
-            cooldown_until = checked_at + timedelta(
-                seconds=cooldown_seconds
-            )
-            self._cooldown_until = cooldown_until
-            result = SlotCheckResult(
-                status=SlotStatus.UNKNOWN,
-                checked_at=checked_at,
-                details=(
-                    "Перевищено ліміт запитів (Too many requests). "
-                    "Увімкнено захисну паузу (Circuit Breaker); "
-                    f"cooldown active for {cooldown_seconds} seconds"
-                ),
-                error=exc.failure_code.value,
-                failure_code=exc.failure_code,
-            )
-            try:
-                await self._notifier.handle_rate_limit(
-                    exc,
-                    attempted_at=checked_at,
-                    cooldown_until=cooldown_until,
-                )
-            except aiosqlite.Error as db_error:
-                logger.exception(
-                    "rate_limit_incident_persist_failed",
-                    extra={
-                        "city": self._settings.city_name,
-                        "error": str(db_error),
-                    },
-                )
+            result = await self._begin_rate_limit_cooldown(exc)
         except HumanActionRequiredError as exc:
             result = SlotCheckResult(
                 status=SlotStatus.UNKNOWN,
@@ -342,7 +310,13 @@ class SlotMonitor:
             )
             await self._persist_attempt(result)
         else:
-            if result.status is SlotStatus.UNKNOWN:
+            if is_rate_limit_failure(result.failure_code):
+                result = await self._begin_rate_limit_cooldown(
+                    RateLimitException(
+                        result.details or "Too many requests, please try again later!"
+                    )
+                )
+            elif result.status is SlotStatus.UNKNOWN:
                 await self._persist_attempt(result)
                 if result.failure_code is ScraperFailureCode.SERVER_ERROR:
                     try:
@@ -373,6 +347,44 @@ class SlotMonitor:
                     )
 
         return await self._finalize_cycle(result)
+
+    async def _begin_rate_limit_cooldown(
+        self,
+        error: RateLimitException,
+    ) -> SlotCheckResult:
+        self._consecutive_rate_limits += 1
+        cooldown_seconds = _rate_limit_cooldown_seconds(
+            self._consecutive_rate_limits
+        )
+        checked_at = datetime.now(timezone.utc)
+        cooldown_until = checked_at + timedelta(seconds=cooldown_seconds)
+        self._cooldown_until = cooldown_until
+        result = SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=checked_at,
+            details=(
+                "Перевищено ліміт запитів (Too many requests). "
+                "Увімкнено захисну паузу (Circuit Breaker); "
+                f"cooldown active for {cooldown_seconds} seconds"
+            ),
+            error=error.failure_code.value,
+            failure_code=error.failure_code,
+        )
+        try:
+            await self._notifier.handle_rate_limit(
+                error,
+                attempted_at=checked_at,
+                cooldown_until=cooldown_until,
+            )
+        except aiosqlite.Error as db_error:
+            logger.exception(
+                "rate_limit_incident_persist_failed",
+                extra={
+                    "city": self._settings.city_name,
+                    "error": str(db_error),
+                },
+            )
+        return result
 
     async def _finalize_cycle(self, result: SlotCheckResult) -> SlotCheckResult:
         self._last_result = result
@@ -474,8 +486,8 @@ class SlotMonitor:
                 "Увімкнено захисну паузу (Circuit Breaker); "
                 f"{remaining} seconds remaining."
             ),
-            error=ScraperFailureCode.RATE_LIMITED.value,
-            failure_code=ScraperFailureCode.RATE_LIMITED,
+            error=ScraperFailureCode.TOO_MANY_REQUESTS.value,
+            failure_code=ScraperFailureCode.TOO_MANY_REQUESTS,
         )
 
     def _active_cooldown_until(
