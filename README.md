@@ -56,7 +56,7 @@ python -m pip install -r requirements.txt
 
 ## Start
 
-For a clean diagnostic restart (stops `src.main`, dedicated CDP Chrome, pending outbox, and monitor latch/cooldown; **keeps subscribers**):
+For a clean diagnostic restart (stops `src.main`, dedicated CDP Chrome, pending outbox, and monitor latch/cooldown; **keeps subscribers**; wipes `CDP_Profile` cookies/cache without deleting the profile directory):
 
 ```powershell
 scripts\clean_run.bat
@@ -114,7 +114,7 @@ Missing tabs, closed tabs, CDP disconnects, and Cloudflare challenges create a p
 - Repeated checks do not reload a challenged page.
 - Open or refresh the exact target tab and complete the challenge manually.
 - A successful visible-state verification clears the incident and resumes normal soft reloads.
-- A visible `Too many requests` response starts a persistent cooldown (15 minutes, doubling up to 2 hours on consecutive hits). Scheduled and manual checks respect it without reloading the page. Administrators receive one latched alert with the cooldown duration and UTC end time.
+- A visible `Too many requests` response starts a persistent cooldown (15 minutes, doubling up to 2 hours on consecutive hits). Cookies and HTTP cache are cleared so the next probe after cooldown (or after `scripts\clean_run.bat`) is a hard navigation, not a cached block page. Scheduled and manual checks respect an active cooldown without reloading. `--check-once` does not restore a persisted cooldown. Administrators receive one latched alert with the cooldown duration and UTC end time.
 - PHP/Joomla backend error pages (`DateTimeZone::__construct`, HTTP 500, Ukrainian request-processing errors) are transient `server_error` results. Cookies are cleared and the monitor retries; administrators are not Telegram-alerted (there is no actionable step). Cloudflare challenges still send a latched human-action alert.
 - Three consecutive UNKNOWN/server_error results double the next poll interval and send one circuit-breaker diagnostic.
 

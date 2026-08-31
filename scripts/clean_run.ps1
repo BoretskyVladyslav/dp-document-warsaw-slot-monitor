@@ -32,3 +32,36 @@ if (Test-Path $freePort) {
 }
 
 Write-Output "Processes stopped. Waiting before SQLite reset..."
+
+$profileDir = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\CDP_Profile"
+$defaultDir = Join-Path $profileDir "Default"
+if (Test-Path -LiteralPath $defaultDir) {
+    Write-Output "Clearing CDP_Profile cache and cookies (profile structure kept)..."
+    $cacheRelPaths = @(
+        "Cache",
+        "Code Cache",
+        "GPUCache",
+        "GrShaderCache",
+        "ShaderCache",
+        "DawnCache",
+        "Application Cache",
+        "Service Worker\CacheStorage",
+        "Service Worker\ScriptCache",
+        "Local Storage",
+        "Session Storage",
+        "Cookies",
+        "Cookies-journal",
+        "Network\Cookies",
+        "Network\Cookies-journal",
+        "Network\Network Persistent State",
+        "Network\TransportSecurity"
+    )
+    foreach ($relative in $cacheRelPaths) {
+        $target = Join-Path $defaultDir $relative
+        if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+} else {
+    Write-Output "CDP_Profile Default directory not found; skipping cache wipe."
+}

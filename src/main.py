@@ -115,7 +115,7 @@ async def _amain(settings: Settings) -> None:
             notifier=notifier,
             started_at=started_at,
         )
-        await monitor.restore_state()
+        await monitor.restore_state(restore_cooldown=not settings.check_once)
         if settings.check_once:
             await monitor.run_once()
             return

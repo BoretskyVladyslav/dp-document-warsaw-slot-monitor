@@ -259,6 +259,8 @@ class SlotScraper:
         self._browser: Browser | None = None
         self._operation_lock = asyncio.Lock()
         self._latched_failure: ScraperFailureCode | None = None
+        self._hard_reload_pending = False
+        self._cf_hold_timed_out = False
         self._health = ScraperHealthSnapshot(
             status=ScraperHealthStatus.STOPPED,
             cdp_connected=False,
@@ -268,6 +270,9 @@ class SlotScraper:
 
     async def get_health_snapshot(self) -> ScraperHealthSnapshot:
         return self._health
+
+    async def arm_hard_reload(self) -> None:
+        self._hard_reload_pending = True
 
     async def start(self) -> None:
         async with self._operation_lock:
@@ -288,6 +293,8 @@ class SlotScraper:
                 await self._start_unlocked()
                 page = self._find_target_page()
                 if self._latched_failure is not None:
+                    if self._hard_reload_pending:
+                        await self._navigate_target(page)
                     return await self._probe_latched_page(page)
                 return await self._reload_and_classify(page)
             except RateLimitException as exc:
@@ -427,10 +434,7 @@ class SlotScraper:
     async def _reload_and_classify(self, page: Page) -> SlotCheckResult:
         self._require_cdp_connected()
         try:
-            await page.reload(
-                wait_until="domcontentloaded",
-                timeout=_CDP_RELOAD_TIMEOUT_MS,
-            )
+            await self._navigate_target(page)
         except PlaywrightTimeoutError as exc:
             if self._page_is_closed(page):
                 raise TargetTabClosedError("target tab closed during soft reload") from exc
@@ -438,7 +442,7 @@ class SlotScraper:
             if immediate is not None:
                 return immediate
             evidence = await collect_dom_evidence(page)
-            self._raise_if_rate_limited(evidence)
+            await self._raise_if_rate_limited(page, evidence)
             if has_cloudflare_challenge(evidence):
                 raise CloudflareChallengeError(
                     "Cloudflare challenge appeared during soft reload"
@@ -471,6 +475,7 @@ class SlotScraper:
             if has_server_error_source(title=title, html=html):
                 return await self._emit_server_error(page)
             if has_rate_limit_source(title=title, html=html):
+                await self._prepare_rate_limit_recovery(page)
                 raise RateLimitException(
                     "Too many requests, please try again later"
                 )
@@ -480,7 +485,7 @@ class SlotScraper:
             if is_execution_context_destroyed(exc):
                 return None
             raise
-        self._raise_if_rate_limited(evidence)
+        await self._raise_if_rate_limited(page, evidence)
         if has_server_error_page(evidence):
             return await self._emit_server_error(page)
         return None
@@ -519,6 +524,52 @@ class SlotScraper:
                 extra={"city": self._settings.city_name, "error": str(exc)},
             )
 
+    async def _prepare_rate_limit_recovery(self, page: Page) -> None:
+        self._hard_reload_pending = True
+        await self._clear_target_cookies(page)
+        logger.info(
+            "rate_limit_recovery_armed",
+            extra={"city": self._settings.city_name},
+        )
+
+    async def _clear_http_cache(self, page: Page) -> None:
+        new_cdp_session = getattr(page.context, "new_cdp_session", None)
+        if new_cdp_session is None:
+            return
+        try:
+            session = await new_cdp_session(page)
+            await session.send("Network.clearBrowserCache")
+            await session.send("Network.setCacheDisabled", {"cacheDisabled": True})
+        except PlaywrightError as exc:
+            logger.warning(
+                "http_cache_clear_failed",
+                extra={"city": self._settings.city_name, "error": str(exc)},
+            )
+
+    async def _hard_reload_target(self, page: Page) -> None:
+        await self._clear_target_cookies(page)
+        await self._clear_http_cache(page)
+        target = str(self._settings.target_url)
+        logger.info(
+            "hard_reload_after_rate_limit",
+            extra={"city": self._settings.city_name, "url": target},
+        )
+        await page.goto(
+            target,
+            wait_until="domcontentloaded",
+            timeout=_CDP_RELOAD_TIMEOUT_MS,
+        )
+
+    async def _navigate_target(self, page: Page) -> None:
+        if not self._hard_reload_pending:
+            await page.reload(
+                wait_until="domcontentloaded",
+                timeout=_CDP_RELOAD_TIMEOUT_MS,
+            )
+            return
+        await self._hard_reload_target(page)
+        self._hard_reload_pending = False
+
     async def _managed_challenge_present(self, page: Page) -> bool:
         source = await self._read_page_source(page)
         if source is not None:
@@ -537,6 +588,7 @@ class SlotScraper:
         evidence: SlotPageEvidence,
     ) -> SlotCheckResult | None:
         if not has_cloudflare_challenge(evidence):
+            self._cf_hold_timed_out = False
             return None
         logger.warning(
             "managed_challenge_hold_timeout",
@@ -545,10 +597,14 @@ class SlotScraper:
                 "cf_persists": True,
             },
         )
-        if self._latched_failure is not None:
+        if (
+            self._latched_failure is not None
+            or self._cf_hold_timed_out
+        ):
             raise CloudflareChallengeError(
                 "Cloudflare challenge page detected"
             )
+        self._cf_hold_timed_out = True
         logger.warning(
             "cloudflare_challenge_delayed_auto_resolve",
             extra={"city": self._settings.city_name},
@@ -561,6 +617,7 @@ class SlotScraper:
     async def _wait_out_managed_challenge(self, page: Page) -> SlotCheckResult | None:
         self._require_cdp_connected()
         if not await self._managed_challenge_present(page):
+            self._cf_hold_timed_out = False
             return None
         logger.info(
             "managed_challenge_hold",
@@ -610,6 +667,7 @@ class SlotScraper:
                 if is_execution_context_destroyed(retry_exc):
                     return None
                 raise
+        self._cf_hold_timed_out = False
         logger.info(
             "managed_challenge_cleared",
             extra={"city": self._settings.city_name},
@@ -815,6 +873,7 @@ class SlotScraper:
         if status >= 500:
             return await self._emit_server_error(page)
         if status == 429:
+            await self._prepare_rate_limit_recovery(page)
             raise RateLimitException("XHR Rate Limit")
         if not bool(getattr(response, "ok", False)):
             return self._unknown_result(
@@ -860,7 +919,7 @@ class SlotScraper:
                 "target tab still requires Cloudflare verification"
             )
         evidence = await collect_dom_evidence(page)
-        self._raise_if_rate_limited(evidence)
+        await self._raise_if_rate_limited(page, evidence)
         if has_cloudflare_challenge(evidence):
             raise CloudflareChallengeError(
                 "target tab still requires Cloudflare verification"
@@ -908,7 +967,7 @@ class SlotScraper:
         while True:
             self._require_cdp_connected()
             evidence = await collect_dom_evidence(page)
-            self._raise_if_rate_limited(evidence)
+            await self._raise_if_rate_limited(page, evidence)
             if has_cloudflare_challenge(evidence):
                 candidate_status = None
                 candidate_since = None
@@ -957,8 +1016,13 @@ class SlotScraper:
                 )
             await asyncio.sleep(_DOM_POLL_SECONDS)
 
-    def _raise_if_rate_limited(self, evidence: SlotPageEvidence) -> None:
+    async def _raise_if_rate_limited(
+        self,
+        page: Page,
+        evidence: SlotPageEvidence,
+    ) -> None:
         if has_rate_limit_message(evidence):
+            await self._prepare_rate_limit_recovery(page)
             raise RateLimitException(
                 "Too many requests, please try again later"
             )

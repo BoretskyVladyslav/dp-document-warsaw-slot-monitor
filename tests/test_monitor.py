@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -45,6 +45,7 @@ class BlockingScraper:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.cancelled = asyncio.Event()
+        self.arm_hard_reload_calls = 0
 
     async def check_availability(self) -> SlotCheckResult:
         self.calls += 1
@@ -66,6 +67,9 @@ class BlockingScraper:
             target_tab_present=True,
             updated_at=datetime.now(timezone.utc),
         )
+
+    async def arm_hard_reload(self) -> None:
+        self.arm_hard_reload_calls += 1
 
 
 class FakeNotifier:
@@ -333,6 +337,78 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
             900,
         )
         self.assertEqual(notifier.drain_calls, 2)
+
+    async def test_restore_state_reloads_future_cooldown(self) -> None:
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        await self.db.connection.execute(
+            """
+            INSERT INTO monitor_state (
+                city_key, slot_state, last_verified_state, cooldown_until
+            ) VALUES (?, 'NO_SLOTS', 'NO_SLOTS', ?)
+            """,
+            (self.settings.city_name.strip().lower(), future.isoformat()),
+        )
+        await self.db.connection.commit()
+        scraper = BlockingScraper(
+            result=SlotCheckResult(
+                status=SlotStatus.NO_SLOTS,
+                checked_at=self.checked_at,
+            )
+        )
+        scraper.release.set()
+        monitor = self._monitor(scraper, FakeNotifier())
+
+        await monitor.restore_state()
+        skipped = await monitor.run_once()
+
+        self.assertEqual(skipped.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertIn("seconds remaining", skipped.details)
+        self.assertEqual(scraper.calls, 0)
+        self.assertEqual(scraper.arm_hard_reload_calls, 1)
+
+    async def test_check_once_restore_skips_persisted_cooldown(self) -> None:
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        await self.db.connection.execute(
+            """
+            INSERT INTO monitor_state (
+                city_key, slot_state, last_verified_state, cooldown_until
+            ) VALUES (?, 'NO_SLOTS', 'NO_SLOTS', ?)
+            """,
+            (self.settings.city_name.strip().lower(), future.isoformat()),
+        )
+        await self.db.connection.commit()
+        result = SlotCheckResult(
+            status=SlotStatus.NO_SLOTS,
+            checked_at=self.checked_at,
+            details="visible occupied banner",
+        )
+        scraper = BlockingScraper(result=result)
+        scraper.release.set()
+        monitor = self._monitor(scraper, FakeNotifier())
+
+        await monitor.restore_state(restore_cooldown=False)
+        probed = await monitor.run_once()
+
+        self.assertEqual(probed.status, SlotStatus.NO_SLOTS)
+        self.assertEqual(scraper.calls, 1)
+        self.assertEqual(scraper.arm_hard_reload_calls, 1)
+
+    async def test_expired_cooldown_arms_hard_reload_before_probe(self) -> None:
+        result = SlotCheckResult(
+            status=SlotStatus.NO_SLOTS,
+            checked_at=self.checked_at,
+            details="visible occupied banner",
+        )
+        scraper = BlockingScraper(result=result)
+        scraper.release.set()
+        monitor = self._monitor(scraper, FakeNotifier())
+        monitor._cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        probed = await monitor.run_once()
+
+        self.assertEqual(probed.status, SlotStatus.NO_SLOTS)
+        self.assertEqual(scraper.calls, 1)
+        self.assertEqual(scraper.arm_hard_reload_calls, 1)
 
     async def test_check_now_rate_limit_enters_cooldown_and_alerts(self) -> None:
         failure = RateLimitException(

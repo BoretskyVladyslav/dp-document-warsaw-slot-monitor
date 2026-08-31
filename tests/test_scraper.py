@@ -69,10 +69,6 @@ def challenge_evidence() -> dict[str, object]:
     }
 
 
-def latch_cloudflare(scraper: SlotScraper) -> None:
-    scraper._latch_human_action(CloudflareChallengeError("challenge visible"))
-
-
 class TargetClosedError(Exception):
     pass
 
@@ -260,6 +256,10 @@ class FakePage:
         self.reload_calls = 0
         self.reload_timeout: int | None = None
         self.reload_error: BaseException | None = None
+        self.goto_calls = 0
+        self.goto_url: str | None = None
+        self.goto_timeout: int | None = None
+        self.goto_error: BaseException | None = None
         self.evidence_sequence: list[dict[str, object]] = []
         self.evaluate_errors: list[BaseException] = []
         self.wait_for_selector_calls = 0
@@ -306,6 +306,15 @@ class FakePage:
             raise self.reload_error
         if wait_until != "domcontentloaded":
             raise AssertionError("unexpected load state")
+
+    async def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+        self.goto_calls += 1
+        self.goto_url = url
+        self.goto_timeout = timeout
+        if wait_until != "domcontentloaded":
+            raise AssertionError("unexpected load state")
+        if self.goto_error is not None:
+            raise self.goto_error
 
     async def wait_for_selector(
         self,
@@ -398,6 +407,16 @@ class FakeContext:
 
     async def clear_cookies(self) -> None:
         self.clear_cookies_calls += 1
+
+    async def new_cdp_session(self, page: object) -> FakeCdpSession:
+        del page
+        return FakeCdpSession()
+
+
+class FakeCdpSession:
+    async def send(self, method: str, params: dict[str, object] | None = None) -> dict[str, object]:
+        del method, params
+        return {}
 
 
 class FakeBrowser:
@@ -593,23 +612,13 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(page.reload_calls, 1)
 
-        delayed_again = await scraper.check_availability()
-        self.assertEqual(
-            delayed_again.failure_code,
-            ScraperFailureCode.CLOUDFLARE_DELAYED,
-        )
-        self.assertEqual(page.reload_calls, 2)
-        health = await scraper.get_health_snapshot()
-        self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
-
-        latch_cloudflare(scraper)
         with self.assertRaises(CloudflareChallengeError):
             await scraper.check_availability()
         with self.assertRaises(CloudflareChallengeError):
             await scraper.check_availability()
 
         self.assertEqual(page.reload_calls, 2)
-        self.assertEqual(page.wait_for_function_calls, 4)
+        self.assertEqual(page.wait_for_function_calls, 3)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.NEEDS_HUMAN)
         self.assertEqual(
@@ -653,25 +662,20 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             health.failure_code,
             ScraperFailureCode.CLOUDFLARE_DELAYED,
         )
-        delayed_again = await scraper.check_availability()
-        self.assertEqual(
-            delayed_again.failure_code,
-            ScraperFailureCode.CLOUDFLARE_DELAYED,
-        )
-        self.assertEqual(page.reload_calls, 2)
-        self.assertEqual(page.wait_for_selector_calls, 0)
-        self.assertEqual(page.wait_for_function_calls, 2)
-        latch_cloudflare(scraper)
         with self.assertRaises(CloudflareChallengeError):
             await scraper.check_availability()
         self.assertEqual(page.reload_calls, 2)
-        self.assertEqual(page.wait_for_function_calls, 3)
+        self.assertEqual(page.wait_for_function_calls, 2)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.NEEDS_HUMAN)
         self.assertEqual(
             health.failure_code,
             ScraperFailureCode.CLOUDFLARE_CHALLENGE,
         )
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
+        self.assertEqual(page.reload_calls, 2)
+        self.assertEqual(page.wait_for_function_calls, 3)
 
     async def test_waiting_room_is_treated_as_cloudflare_challenge(self) -> None:
         raw = {
@@ -705,12 +709,6 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ScraperFailureCode.CLOUDFLARE_DELAYED,
         )
         self.assertEqual(page.wait_for_selector_calls, 0)
-        delayed_again = await scraper.check_availability()
-        self.assertEqual(
-            delayed_again.failure_code,
-            ScraperFailureCode.CLOUDFLARE_DELAYED,
-        )
-        latch_cloudflare(scraper)
         with self.assertRaises(CloudflareChallengeError):
             await scraper.check_availability()
         health = await scraper.get_health_snapshot()
@@ -831,17 +829,61 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "Too many requests, please try again later!     /g"
         )
         page = FakePage(TARGET_URL, raw)
+        context = FakeContext([page])
         scraper = SlotScraper(settings())
-        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+        scraper._browser = FakeBrowser([context])  # type: ignore[assignment]
 
         with self.assertRaises(RateLimitException):
             await scraper.check_availability()
 
         self.assertEqual(page.reload_calls, 1)
         self.assertEqual(page.wait_for_selector_calls, 0)
+        self.assertEqual(context.clear_cookies_calls, 1)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.DEGRADED)
         self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)
+
+    async def test_rate_limit_hard_reloads_on_next_cycle(self) -> None:
+        raw = free_evidence()
+        raw["visibleText"] = (
+            "Too many requests, please try again later!     /g"
+        )
+        page = FakePage(TARGET_URL, raw)
+        context = FakeContext([page])
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([context])  # type: ignore[assignment]
+
+        with self.assertRaises(RateLimitException):
+            await scraper.check_availability()
+
+        page.evidence = free_evidence()
+        page.html = ""
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.goto_calls, 1)
+        self.assertEqual(page.goto_url, TARGET_URL)
+        self.assertGreaterEqual(context.clear_cookies_calls, 2)
+
+    async def test_hard_reload_retries_if_goto_fails(self) -> None:
+        page = FakePage(TARGET_URL)
+        context = FakeContext([page])
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([context])  # type: ignore[assignment]
+        await scraper.arm_hard_reload()
+        page.goto_error = PlaywrightTimeoutError("Timeout")
+
+        result = await scraper.check_availability()
+        self.assertEqual(result.failure_code, ScraperFailureCode.NAVIGATION_TIMEOUT)
+        self.assertEqual(page.goto_calls, 1)
+        self.assertTrue(scraper._hard_reload_pending)
+
+        page.goto_error = None
+        recovered = await scraper.check_availability()
+        self.assertEqual(recovered.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(page.goto_calls, 2)
+        self.assertFalse(scraper._hard_reload_pending)
 
     async def test_backend_error_page_is_degraded_not_human_action(self) -> None:
         raw = free_evidence()
@@ -933,12 +975,13 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             delayed.failure_code,
             ScraperFailureCode.CLOUDFLARE_DELAYED,
         )
-        latch_cloudflare(scraper)
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
         page.evidence = free_evidence()
         result = await scraper.check_availability()
 
         self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
-        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.reload_calls, 2)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.READY)
         self.assertIsNone(health.failure_code)
@@ -952,7 +995,8 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             delayed.failure_code,
             ScraperFailureCode.CLOUDFLARE_DELAYED,
         )
-        latch_cloudflare(scraper)
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
 
         incomplete = free_evidence()
         incomplete["serviceOptionSelected"] = False
@@ -987,7 +1031,8 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             delayed.failure_code,
             ScraperFailureCode.CLOUDFLARE_DELAYED,
         )
-        latch_cloudflare(scraper)
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
 
         page.evidence_sequence = [
             free_evidence(),
@@ -998,7 +1043,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         result = await scraper.check_availability()
 
         self.assertEqual(result.status, SlotStatus.NO_SLOTS)
-        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.reload_calls, 2)
         self.assertEqual(page.select_option_calls, [0, 1])
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.READY)
@@ -1014,12 +1059,10 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
             delayed.failure_code,
             ScraperFailureCode.CLOUDFLARE_DELAYED,
         )
-        latch_cloudflare(scraper)
-
         with self.assertRaises(CloudflareChallengeError):
             await scraper.check_availability()
 
-        self.assertEqual(page.reload_calls, 1)
+        self.assertEqual(page.reload_calls, 2)
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.NEEDS_HUMAN)
         self.assertEqual(
@@ -1119,6 +1162,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)
+        self.assertEqual(page.context.clear_cookies_calls, 1)
 
     async def test_xhr_4xx_returns_service_validate_error(self) -> None:
         page = FakePage(TARGET_URL)

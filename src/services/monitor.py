@@ -75,18 +75,34 @@ class SlotMonitor:
     def city_key(self) -> str:
         return self._settings.city_name.strip().lower()
 
-    async def restore_state(self) -> None:
+    async def restore_state(self, *, restore_cooldown: bool = True) -> None:
         state = await get_monitor_state(self._database.connection, self.city_key)
         if state is None:
             return
         self._cached_state = state.verified_state
         self._last_verified_at = state.last_verified_at
+        had_cooldown = state.cooldown_until is not None
+        if not restore_cooldown:
+            self._cooldown_until = None
+            if had_cooldown:
+                await self._scraper.arm_hard_reload()
+            return
         now = datetime.now(timezone.utc)
         self._cooldown_until = (
             state.cooldown_until
             if state.cooldown_until is not None and state.cooldown_until > now
             else None
         )
+        if had_cooldown:
+            await self._scraper.arm_hard_reload()
+        if self._cooldown_until is not None:
+            logger.info(
+                "rate_limit_cooldown_restored",
+                extra={
+                    "city": self._settings.city_name,
+                    "cooldown_until": self._cooldown_until.isoformat(),
+                },
+            )
 
     async def run_once(self) -> SlotCheckResult:
         return await self._run_singleflight(source="run_once")
@@ -179,7 +195,7 @@ class SlotMonitor:
                 raise RuntimeError("slot monitor is shutting down")
             task = self._inflight_check
             if task is None or task.done():
-                immediate_result = self._cooldown_result(source=source)
+                immediate_result = await self._cooldown_result(source=source)
                 if (
                     immediate_result is None
                     and source == "admin"
@@ -431,7 +447,7 @@ class SlotMonitor:
             interval *= 2
         return _jittered_check_delay(interval)
 
-    def _cooldown_result(self, *, source: str) -> SlotCheckResult | None:
+    async def _cooldown_result(self, *, source: str) -> SlotCheckResult | None:
         cooldown_until = self._cooldown_until
         if cooldown_until is None:
             return None
@@ -439,6 +455,7 @@ class SlotMonitor:
         remaining = math.ceil((cooldown_until - now).total_seconds())
         if remaining <= 0:
             self._cooldown_until = None
+            await self._scraper.arm_hard_reload()
             return None
         logger.info(
             "rate_limit_cooldown_active",

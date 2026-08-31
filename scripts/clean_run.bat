@@ -22,4 +22,5 @@ echo Cleanup complete. Next:
 echo   1. scripts\start_chrome_cdp.bat
 echo   2. Complete Cloudflare in the opened target tab if shown.
 echo   3. .venv\Scripts\python.exe -m src.main
+echo Monitor latch/cooldown was reset. CDP_Profile cookies/cache were wiped.
 endlocal
