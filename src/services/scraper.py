@@ -49,14 +49,15 @@ _CDP_CONNECT_TIMEOUT_MS = 15_000
 _CDP_RELOAD_TIMEOUT_MS = 15_000
 _DOM_SIGNAL_TIMEOUT_MS = 15_000
 _QUEUE_UI_WAIT_MS = 20_000
+_QUEUE_UI_NETWORKIDLE_MS = 10_000
 _CONTEXT_RETRY_SECONDS = 3.0
 _DOM_POLL_SECONDS = 0.25
 _DOM_STABILITY_SECONDS = 3.0
-_SERVICE_SELECT_TIMEOUT_MS = 5_000
+_SERVICE_SELECT_TIMEOUT_MS = 15_000
 _SERVICE_PLACEHOLDER_INDEX = 0
 _SERVICE_OPTION_INDEX = 1
 _SERVICE_OPTION_ATTACH_TIMEOUT_MS = 10_000
-_SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS = 10_000
+_SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS = 15_000
 _SUSPICIOUS_VALIDATE_SECONDS = 0.2
 _CF_INTERSTITIAL_HOLD_SECONDS = 10.0
 _CF_MANAGED_CHALLENGE_HOLD_MS = 15_000
@@ -674,18 +675,40 @@ class SlotScraper:
         )
         return None
 
-    async def _wait_for_queue_ui(self, page: Page) -> None:
-        self._require_cdp_connected()
+    async def _wait_for_queue_selector(self, page: Page) -> None:
+        await page.wait_for_selector(
+            _QUEUE_UI_SELECTOR,
+            timeout=_QUEUE_UI_WAIT_MS,
+            state="visible",
+        )
+
+    async def _wait_for_queue_network_idle(self, page: Page) -> None:
         try:
-            await page.wait_for_selector(
-                _QUEUE_UI_SELECTOR,
-                timeout=_QUEUE_UI_WAIT_MS,
-                state="visible",
+            await page.wait_for_load_state(
+                "networkidle",
+                timeout=_QUEUE_UI_NETWORKIDLE_MS,
             )
         except PlaywrightTimeoutError:
             logger.info(
-                "queue_ui_wait_timeout",
-                extra={"city": self._settings.city_name, "timeout_ms": _QUEUE_UI_WAIT_MS},
+                "queue_ui_networkidle_timeout",
+                extra={
+                    "city": self._settings.city_name,
+                    "timeout_ms": _QUEUE_UI_NETWORKIDLE_MS,
+                },
+            )
+
+    async def _wait_for_queue_ui(self, page: Page) -> None:
+        self._require_cdp_connected()
+        try:
+            await self._wait_for_queue_selector(page)
+            return
+        except PlaywrightTimeoutError:
+            logger.info(
+                "queue_ui_wait_retry",
+                extra={
+                    "city": self._settings.city_name,
+                    "timeout_ms": _QUEUE_UI_WAIT_MS,
+                },
             )
         except PlaywrightError as exc:
             if is_target_closed_error(exc) or self._page_is_closed(page):
@@ -704,28 +727,25 @@ class SlotScraper:
                 raise TargetTabClosedError(
                     "target tab closed while waiting for queue UI"
                 ) from exc
-            try:
-                await page.wait_for_selector(
-                    _QUEUE_UI_SELECTOR,
-                    timeout=_QUEUE_UI_WAIT_MS,
-                    state="visible",
-                )
-            except PlaywrightTimeoutError:
-                logger.info(
-                    "queue_ui_wait_timeout",
-                    extra={
-                        "city": self._settings.city_name,
-                        "timeout_ms": _QUEUE_UI_WAIT_MS,
-                    },
-                )
-            except PlaywrightError as retry_exc:
-                if is_target_closed_error(retry_exc) or self._page_is_closed(page):
-                    raise TargetTabClosedError(
-                        "target tab closed while waiting for queue UI"
-                    ) from retry_exc
-                if is_execution_context_destroyed(retry_exc):
-                    return
-                raise
+        try:
+            await self._wait_for_queue_network_idle(page)
+            await self._wait_for_queue_selector(page)
+        except PlaywrightTimeoutError:
+            logger.info(
+                "queue_ui_wait_timeout",
+                extra={
+                    "city": self._settings.city_name,
+                    "timeout_ms": _QUEUE_UI_WAIT_MS,
+                },
+            )
+        except PlaywrightError as retry_exc:
+            if is_target_closed_error(retry_exc) or self._page_is_closed(page):
+                raise TargetTabClosedError(
+                    "target tab closed while waiting for queue UI"
+                ) from retry_exc
+            if is_execution_context_destroyed(retry_exc):
+                return
+            raise
 
     async def _select_first_service(self, page: Page) -> SlotCheckResult | None:
         self._require_cdp_connected()

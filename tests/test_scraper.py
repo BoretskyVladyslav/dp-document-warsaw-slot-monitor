@@ -18,8 +18,11 @@ from src.core.models import ScraperFailureCode, ScraperHealthStatus, SlotStatus
 from src.services.scraper import (
     SlotScraper,
     _CF_MANAGED_CHALLENGE_HOLD_MS,
+    _QUEUE_UI_NETWORKIDLE_MS,
     _QUEUE_UI_SELECTOR,
     _QUEUE_UI_WAIT_MS,
+    _SERVICE_SELECT_TIMEOUT_MS,
+    _SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS,
     cdp_tab_matches,
     collect_dom_evidence,
     is_execution_context_destroyed,
@@ -266,6 +269,11 @@ class FakePage:
         self.wait_for_selector_timeout: int | None = None
         self.wait_for_selector_selector: str | None = None
         self.wait_for_selector_error: BaseException | None = None
+        self.wait_for_selector_errors: list[BaseException] = []
+        self.wait_for_load_state_calls = 0
+        self.wait_for_load_state_state: str | None = None
+        self.wait_for_load_state_timeout: int | None = None
+        self.wait_for_load_state_error: BaseException | None = None
         self.wait_for_function_calls = 0
         self.wait_for_function_timeout: int | None = None
         self.wait_for_function_succeeds = False
@@ -327,8 +335,17 @@ class FakePage:
         self.wait_for_selector_calls += 1
         self.wait_for_selector_timeout = timeout
         self.wait_for_selector_selector = selector
+        if self.wait_for_selector_errors:
+            raise self.wait_for_selector_errors.pop(0)
         if self.wait_for_selector_error is not None:
             raise self.wait_for_selector_error
+
+    async def wait_for_load_state(self, state: str, *, timeout: int) -> None:
+        self.wait_for_load_state_calls += 1
+        self.wait_for_load_state_state = state
+        self.wait_for_load_state_timeout = timeout
+        if self.wait_for_load_state_error is not None:
+            raise self.wait_for_load_state_error
 
     async def wait_for_function(self, expression: str, *, timeout: int) -> None:
         del expression
@@ -583,14 +600,18 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("select", page.locator_selectors)
         self.assertIn("option", page.locator_selectors)
         self.assertEqual(page.select_option_calls, [0, 1])
-        self.assertEqual(page.select_option_timeout, 5_000)
+        self.assertEqual(page.select_option_timeout, 15_000)
         self.assertEqual(page.option_wait_calls[0]["state"], "attached")
         self.assertEqual(page.option_wait_calls[0]["timeout"], 10_000)
         self.assertEqual(page.expect_response_calls, 1)
-        self.assertEqual(page.expect_response_timeout, 10_000)
+        self.assertEqual(page.expect_response_timeout, 15_000)
         self.assertEqual(page.wait_for_function_calls, 0)
+        self.assertEqual(page.wait_for_load_state_calls, 0)
         self.assertEqual(context.new_page_calls, 0)
         self.assertEqual(_QUEUE_UI_WAIT_MS, 20_000)
+        self.assertEqual(_QUEUE_UI_NETWORKIDLE_MS, 10_000)
+        self.assertEqual(_SERVICE_SELECT_TIMEOUT_MS, 15_000)
+        self.assertEqual(_SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS, 15_000)
         self.assertEqual(_CF_MANAGED_CHALLENGE_HOLD_MS, 15_000)
 
     async def test_challenge_latches_and_does_not_reload_again(self) -> None:
@@ -820,8 +841,24 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
         self.assertEqual(page.wait_for_selector_calls, 2)
+        self.assertEqual(page.wait_for_load_state_calls, 1)
+        self.assertEqual(page.wait_for_load_state_state, "networkidle")
         self.assertEqual(page.select_option_calls, [0, 1])
         self.assertEqual(page.reload_calls, 1)
+
+    async def test_queue_ui_retries_after_selector_timeout(self) -> None:
+        page = FakePage(TARGET_URL)
+        page.wait_for_selector_errors = [PlaywrightTimeoutError("Timeout")]
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        result = await scraper.check_availability()
+
+        self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
+        self.assertEqual(page.wait_for_selector_calls, 2)
+        self.assertEqual(page.wait_for_load_state_calls, 1)
+        self.assertEqual(page.wait_for_load_state_state, "networkidle")
+        self.assertEqual(page.wait_for_load_state_timeout, 10_000)
 
     async def test_rate_limit_message_raises_typed_failure(self) -> None:
         raw = free_evidence()

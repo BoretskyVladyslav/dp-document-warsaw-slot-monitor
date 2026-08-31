@@ -26,8 +26,20 @@ from src.database.monitor_state import get_monitor_state
 from src.database.schema import init_schema
 from src.services.monitor import (
     SlotMonitor,
+    _CYCLE_TIMEOUT_SECONDS,
     _jittered_check_delay,
     _rate_limit_cooldown_seconds,
+)
+from src.services.scraper import (
+    _CDP_CONNECT_TIMEOUT_MS,
+    _CDP_RELOAD_TIMEOUT_MS,
+    _CF_MANAGED_CHALLENGE_HOLD_MS,
+    _DOM_SIGNAL_TIMEOUT_MS,
+    _QUEUE_UI_NETWORKIDLE_MS,
+    _QUEUE_UI_WAIT_MS,
+    _SERVICE_OPTION_ATTACH_TIMEOUT_MS,
+    _SERVICE_SELECT_TIMEOUT_MS,
+    _SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS,
 )
 
 TARGET_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
@@ -168,6 +180,25 @@ class SlotMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_rate_limit_cooldown_seconds(3), 3600)
         self.assertEqual(_rate_limit_cooldown_seconds(4), 7200)
         self.assertEqual(_rate_limit_cooldown_seconds(5), 7200)
+
+    def test_cycle_timeout_covers_post_cf_ui_wait_budget(self) -> None:
+        budget_ms = (
+            _CDP_CONNECT_TIMEOUT_MS
+            + _CDP_RELOAD_TIMEOUT_MS
+            + _CF_MANAGED_CHALLENGE_HOLD_MS
+            + _QUEUE_UI_WAIT_MS
+            + _QUEUE_UI_NETWORKIDLE_MS
+            + _QUEUE_UI_WAIT_MS
+            + _SERVICE_OPTION_ATTACH_TIMEOUT_MS
+            + _SERVICE_SELECT_TIMEOUT_MS
+            + max(
+                _SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS,
+                _SERVICE_SELECT_TIMEOUT_MS,
+            )
+            + _DOM_SIGNAL_TIMEOUT_MS
+        )
+        self.assertGreaterEqual(_CYCLE_TIMEOUT_SECONDS * 1000, budget_ms)
+        self.assertEqual(_CYCLE_TIMEOUT_SECONDS, 180.0)
 
     async def test_scheduled_and_manual_checks_share_one_inflight_task(self) -> None:
         result = SlotCheckResult(

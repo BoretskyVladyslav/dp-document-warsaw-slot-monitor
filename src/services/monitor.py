@@ -24,7 +24,7 @@ from src.services.notifier import Notifier
 from src.services.scraper import SlotScraper
 
 logger = logging.getLogger(__name__)
-_CYCLE_TIMEOUT_SECONDS = 90.0
+_CYCLE_TIMEOUT_SECONDS = 180.0
 _MANUAL_CHECK_INTERVAL_SECONDS = 30
 _RATE_LIMIT_BASE_COOLDOWN_SECONDS = 900
 _RATE_LIMIT_MAX_COOLDOWN_SECONDS = 7200
