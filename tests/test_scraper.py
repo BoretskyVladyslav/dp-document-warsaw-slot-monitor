@@ -870,9 +870,17 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         scraper = SlotScraper(settings())
         scraper._browser = FakeBrowser([context])  # type: ignore[assignment]
 
-        with self.assertRaises(RateLimitException):
-            await scraper.check_availability()
+        with self.assertLogs("src.services.scraper", level="WARNING") as logs:
+            with self.assertRaises(RateLimitException) as raised:
+                await scraper.check_availability()
 
+        self.assertEqual(
+            str(raised.exception),
+            "Too many requests, please try again later!",
+        )
+        self.assertTrue(
+            any("rate_limit_exceeded" in message for message in logs.output)
+        )
         self.assertEqual(page.reload_calls, 1)
         self.assertEqual(page.wait_for_selector_calls, 0)
         self.assertEqual(context.clear_cookies_calls, 1)
@@ -1194,8 +1202,13 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         scraper = SlotScraper(settings())
         scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
 
-        with self.assertRaises(RateLimitException):
-            await scraper.check_availability()
+        with self.assertLogs("src.services.scraper", level="WARNING") as logs:
+            with self.assertRaises(RateLimitException):
+                await scraper.check_availability()
+
+        self.assertTrue(
+            any("rate_limit_exceeded" in message for message in logs.output)
+        )
 
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.failure_code, ScraperFailureCode.RATE_LIMITED)

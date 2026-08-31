@@ -40,6 +40,12 @@ _DISPATCH_CONCURRENCY = 20
 _OUTBOX_BATCH_SIZE = 500
 
 
+RATE_LIMIT_PAUSE_TEXT = (
+    "Перевищено ліміт запитів (Too many requests). "
+    "Увімкнено захисну паузу (Circuit Breaker)"
+)
+
+
 def format_rate_limit_alert(
     *,
     city_name: str,
@@ -48,10 +54,10 @@ def format_rate_limit_alert(
 ) -> str:
     until = cooldown_until.isoformat(sep=" ", timespec="seconds")
     return (
-        f"⏸️ Rate limit — {city_name}\n\n"
-        f"Cooldown: {cooldown_seconds} seconds\n"
-        f"Until: {until} UTC\n"
-        "Scheduled and /check_now checks will skip until then."
+        f"{RATE_LIMIT_PAUSE_TEXT}\n\n"
+        f"Місто: {city_name}\n"
+        f"Пауза: {cooldown_seconds} с\n"
+        f"До: {until} UTC"
     )
 
 

@@ -289,7 +289,8 @@ class SlotMonitor:
                 status=SlotStatus.UNKNOWN,
                 checked_at=checked_at,
                 details=(
-                    "Server rate limit detected; "
+                    "Перевищено ліміт запитів (Too many requests). "
+                    "Увімкнено захисну паузу (Circuit Breaker); "
                     f"cooldown active for {cooldown_seconds} seconds"
                 ),
                 error=exc.failure_code.value,
@@ -468,7 +469,11 @@ class SlotMonitor:
         return SlotCheckResult(
             status=SlotStatus.UNKNOWN,
             checked_at=now,
-            details=f"Rate-limit cooldown active; {remaining} seconds remaining.",
+            details=(
+                "Перевищено ліміт запитів (Too many requests). "
+                "Увімкнено захисну паузу (Circuit Breaker); "
+                f"{remaining} seconds remaining."
+            ),
             error=ScraperFailureCode.RATE_LIMITED.value,
             failure_code=ScraperFailureCode.RATE_LIMITED,
         )

@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from src.core.models import MonitorSnapshot, SlotCheckResult, SlotStatus
+from src.core.models import (
+    MonitorSnapshot,
+    ScraperFailureCode,
+    SlotCheckResult,
+    SlotStatus,
+)
+
+RATE_LIMIT_PAUSE_TEXT = (
+    "Перевищено ліміт запитів (Too many requests). "
+    "Увімкнено захисну паузу (Circuit Breaker)"
+)
 
 
 def format_start_confirmation(city_name: str) -> str:
@@ -43,6 +53,8 @@ def format_status(snapshot: MonitorSnapshot, *, is_admin: bool) -> str:
         f"Остання підтверджена перевірка: {last_verified}\n"
         f"Запис: {snapshot.target_url}"
     )
+    if _is_rate_limited(snapshot):
+        public_text = f"{public_text}\n{RATE_LIMIT_PAUSE_TEXT}"
     if not is_admin:
         return public_text
 
@@ -87,17 +99,33 @@ def format_check_result(result: SlotCheckResult) -> str:
     checked_at = result.checked_at.isoformat(sep=" ", timespec="seconds")
     details = result.details or "—"
     error = f"\nПомилка: {result.error}" if result.error else ""
+    rate_limit = ""
+    if (
+        result.failure_code is ScraperFailureCode.RATE_LIMITED
+        or result.error == ScraperFailureCode.RATE_LIMITED.value
+    ):
+        rate_limit = f"\n{RATE_LIMIT_PAUSE_TEXT}"
     return (
         "Ручну перевірку завершено.\n"
         f"Стан: {_status_label(result.status)}\n"
         f"Час: {checked_at}\n"
         f"Деталі: {details}"
         f"{error}"
+        f"{rate_limit}"
     )
 
 
 def format_admin_only() -> str:
     return "Команда доступна лише адміністратору."
+
+
+def _is_rate_limited(snapshot: MonitorSnapshot) -> bool:
+    health = snapshot.scraper_health
+    if snapshot.last_error == ScraperFailureCode.RATE_LIMITED.value:
+        return True
+    if health is not None and health.failure_code is ScraperFailureCode.RATE_LIMITED:
+        return True
+    return snapshot.cooldown_until is not None
 
 
 def _status_label(status: SlotStatus) -> str:

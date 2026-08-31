@@ -13,7 +13,11 @@ from src.core.models import (
     SlotStatus,
 )
 from src.handlers.filters import AdminFilter
-from src.handlers.texts import format_check_result, format_status
+from src.handlers.texts import (
+    RATE_LIMIT_PAUSE_TEXT,
+    format_check_result,
+    format_status,
+)
 from src.services.status import StatusService
 
 
@@ -79,6 +83,38 @@ class StatusFormattingTests(unittest.TestCase):
         self.assertIn("Цільова вкладка: ні", text)
         self.assertIn("target_tab_missing", text)
         self.assertIn("Активних підписників: 12", text)
+        self.assertNotIn(RATE_LIMIT_PAUSE_TEXT, text)
+
+    def test_status_reports_too_many_requests_circuit_breaker_pause(self) -> None:
+        checked_at = self.snapshot.last_attempt_at
+        snapshot = MonitorSnapshot(
+            last_check_at=checked_at,
+            slot_state=SlotStatus.UNKNOWN,
+            last_details="too_many_requests",
+            last_error="rate_limited",
+            active_subscribers=12,
+            uptime_seconds=3600,
+            city_name="Warsaw",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            last_attempt_at=checked_at,
+            last_verified_at=checked_at,
+            scraper_health=ScraperHealthSnapshot(
+                status=ScraperHealthStatus.DEGRADED,
+                cdp_connected=True,
+                target_tab_present=True,
+                updated_at=checked_at,  # type: ignore[arg-type]
+                failure_code=ScraperFailureCode.RATE_LIMITED,
+                details="too_many_requests",
+            ),
+            cooldown_until=checked_at,
+        )
+
+        public = format_status(snapshot, is_admin=False)
+        admin = format_status(snapshot, is_admin=True)
+
+        self.assertIn(RATE_LIMIT_PAUSE_TEXT, public)
+        self.assertIn(RATE_LIMIT_PAUSE_TEXT, admin)
+        self.assertIn("rate_limited", admin)
 
     def test_manual_check_result_includes_unknown_error(self) -> None:
         text = format_check_result(
@@ -92,6 +128,20 @@ class StatusFormattingTests(unittest.TestCase):
 
         self.assertIn("Ручну перевірку завершено", text)
         self.assertIn("cloudflare_challenge", text)
+
+    def test_manual_check_result_reports_too_many_requests(self) -> None:
+        text = format_check_result(
+            SlotCheckResult(
+                status=SlotStatus.UNKNOWN,
+                checked_at=self.snapshot.last_attempt_at,  # type: ignore[arg-type]
+                details="too_many_requests",
+                error="rate_limited",
+                failure_code=ScraperFailureCode.RATE_LIMITED,
+            )
+        )
+
+        self.assertIn(RATE_LIMIT_PAUSE_TEXT, text)
+        self.assertIn("rate_limited", text)
 
 
 class HandlerAccessTests(unittest.IsolatedAsyncioTestCase):

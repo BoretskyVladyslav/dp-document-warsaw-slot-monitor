@@ -259,7 +259,12 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.cooldown_until, extended_until)
         self.assertEqual(len(self.sender.sent), 1)
         self.assertEqual(self.sender.sent[0][0], 42)
-        self.assertIn("Cooldown: 900 seconds", self.sender.sent[0][1])
+        self.assertIn(
+            "Перевищено ліміт запитів (Too many requests). "
+            "Увімкнено захисну паузу (Circuit Breaker)",
+            self.sender.sent[0][1],
+        )
+        self.assertIn("Пауза: 900 с", self.sender.sent[0][1])
         self.assertIn("2026-08-29 12:15:00", self.sender.sent[0][1])
 
         await self.notifier.handle_verified_result(

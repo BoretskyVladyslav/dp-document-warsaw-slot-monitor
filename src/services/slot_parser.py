@@ -12,7 +12,10 @@ _DASH_RE = re.compile(r"[–—−]")
 OCCUPIED_HEADING = "вибачте, на даний момент всі місця зайняті!"
 SERVICE_LABEL = "послуга"
 SELECT_PLACEHOLDER = "- обрати -"
+TOO_MANY_REQUESTS_PHRASE = "too many requests, please try again later!"
 RATE_LIMIT_MARKERS: tuple[str, ...] = (
+    TOO_MANY_REQUESTS_PHRASE,
+    "too many requests, please try again later",
     "too many requests",
 )
 _SERVER_ERROR_VISIBLE_MARKERS: tuple[str, ...] = (
@@ -142,6 +145,14 @@ def classify_slot_evidence(
             error=ScraperFailureCode.CLOUDFLARE_CHALLENGE.value,
             failure_code=ScraperFailureCode.CLOUDFLARE_CHALLENGE,
             details="Cloudflare challenge page detected",
+        )
+    if has_rate_limit_message(evidence):
+        return SlotCheckResult(
+            status=SlotStatus.UNKNOWN,
+            checked_at=moment,
+            error=ScraperFailureCode.RATE_LIMITED.value,
+            failure_code=ScraperFailureCode.RATE_LIMITED,
+            details="too_many_requests",
         )
     if has_server_error_page(evidence):
         return SlotCheckResult(

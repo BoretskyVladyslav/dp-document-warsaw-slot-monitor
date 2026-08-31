@@ -476,10 +476,7 @@ class SlotScraper:
             if has_server_error_source(title=title, html=html):
                 return await self._emit_server_error(page)
             if has_rate_limit_source(title=title, html=html):
-                await self._prepare_rate_limit_recovery(page)
-                raise RateLimitException(
-                    "Too many requests, please try again later"
-                )
+                await self._raise_rate_limit(page, source="page_source")
         try:
             evidence = await collect_dom_evidence(page)
         except PlaywrightError as exc:
@@ -893,8 +890,7 @@ class SlotScraper:
         if status >= 500:
             return await self._emit_server_error(page)
         if status == 429:
-            await self._prepare_rate_limit_recovery(page)
-            raise RateLimitException("XHR Rate Limit")
+            await self._raise_rate_limit(page, source="http_429")
         if not bool(getattr(response, "ok", False)):
             return self._unknown_result(
                 ScraperFailureCode.SERVICE_VALIDATE_ERROR,
@@ -1005,6 +1001,8 @@ class SlotScraper:
                 continue
             challenge_since = None
             last_result = classify_slot_evidence(evidence)
+            if last_result.failure_code is ScraperFailureCode.RATE_LIMITED:
+                await self._raise_rate_limit(page, source="classified_evidence")
             if last_result.failure_code is ScraperFailureCode.SERVER_ERROR:
                 return await self._emit_server_error(page)
             if last_result.status is not SlotStatus.UNKNOWN:
@@ -1042,10 +1040,21 @@ class SlotScraper:
         evidence: SlotPageEvidence,
     ) -> None:
         if has_rate_limit_message(evidence):
-            await self._prepare_rate_limit_recovery(page)
-            raise RateLimitException(
-                "Too many requests, please try again later"
-            )
+            await self._raise_rate_limit(page, source="visible_text")
+
+    async def _raise_rate_limit(self, page: Page, *, source: str) -> None:
+        logger.warning(
+            "rate_limit_exceeded",
+            extra={
+                "city": self._settings.city_name,
+                "source": source,
+                "failure_code": ScraperFailureCode.RATE_LIMITED.value,
+            },
+        )
+        await self._prepare_rate_limit_recovery(page)
+        raise RateLimitException(
+            "Too many requests, please try again later!"
+        )
 
     def _require_cdp_connected(self) -> Browser:
         browser = self._browser

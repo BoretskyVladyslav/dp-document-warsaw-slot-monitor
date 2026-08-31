@@ -7,6 +7,7 @@ import pytest
 from src.core.models import ScraperFailureCode, SlotStatus
 from src.services.slot_parser import (
     SlotPageEvidence,
+    TOO_MANY_REQUESTS_PHRASE,
     classify_slot_evidence,
     has_cloudflare_source,
     has_rate_limit_message,
@@ -235,6 +236,7 @@ def test_stale_cloudflare_query_token_does_not_override_visible_form() -> None:
 
 
 def test_rate_limit_message_is_detected_case_insensitively() -> None:
+    assert TOO_MANY_REQUESTS_PHRASE == "too many requests, please try again later!"
     assert has_rate_limit_message(
         evidence(visible_text="TOO MANY REQUESTS,\nplease try again later")
     )
@@ -246,6 +248,21 @@ def test_rate_limit_message_is_detected_case_insensitively() -> None:
     assert has_rate_limit_source(
         html="Too many requests, please try again later!     /g",
     )
+
+
+def test_rate_limit_banner_classifies_as_rate_limited_not_inconclusive() -> None:
+    result = classify_slot_evidence(
+        evidence(
+            visible_text="Too many requests, please try again later!",
+            service_select_visible=True,
+        ),
+        checked_at=CHECKED_AT,
+    )
+
+    assert result.status is SlotStatus.UNKNOWN
+    assert result.failure_code is ScraperFailureCode.RATE_LIMITED
+    assert result.error == "rate_limited"
+    assert result.details == "too_many_requests"
 
 
 @pytest.mark.parametrize(
