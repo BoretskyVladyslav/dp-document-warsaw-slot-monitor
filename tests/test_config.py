@@ -16,6 +16,24 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.admin_ids, [10, 20, 30])
         self.assertEqual(settings.check_interval_seconds, 300)
 
+    def test_parses_padded_and_trailing_comma_admin_ids(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            admin_ids=" 8015085175 , , 42, ",
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            _env_file=None,
+        )
+        self.assertEqual(settings.admin_ids, [8015085175, 42])
+
+    def test_parses_admin_id_list_with_string_parts(self) -> None:
+        settings = Settings(
+            bot_token="1234567890:TESTTOKENVALUE",
+            admin_ids=[" 10 ", "20"],
+            target_url="https://warszawa.pasport.org.ua/solutions/e-queue",
+            _env_file=None,
+        )
+        self.assertEqual(settings.admin_ids, [10, 20])
+
     def test_parses_single_admin_id_as_list(self) -> None:
         settings = Settings(
             bot_token="1234567890:TESTTOKENVALUE",

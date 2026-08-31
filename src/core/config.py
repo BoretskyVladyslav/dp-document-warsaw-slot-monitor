@@ -30,6 +30,17 @@ class Settings(BaseSettings):
             return [int(part.strip()) for part in value.split(",") if part.strip()]
         if isinstance(value, int):
             return [value]
+        if isinstance(value, (list, tuple)):
+            parsed: list[int] = []
+            for item in value:
+                if isinstance(item, bool):
+                    continue
+                if isinstance(item, int):
+                    parsed.append(item)
+                    continue
+                if isinstance(item, str) and item.strip():
+                    parsed.append(int(item.strip()))
+            return parsed
         return value
 
     @field_validator("cdp_url", mode="before")

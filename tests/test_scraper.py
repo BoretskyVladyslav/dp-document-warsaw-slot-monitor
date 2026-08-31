@@ -221,9 +221,16 @@ class FakeLocator:
         return child
 
     async def wait_for(self, *, state: str, timeout: int) -> None:
-        self._page.option_wait_calls.append({"state": state, "timeout": timeout})
-        if self._page.option_wait_error is not None:
-            raise self._page.option_wait_error
+        record = {"state": state, "timeout": timeout}
+        if self._nth is not None:
+            self._page.option_wait_calls.append(record)
+            if self._page.option_wait_error is not None:
+                raise self._page.option_wait_error
+            return
+        self._page.select_wait_calls.append(record)
+
+    async def dispatch_event(self, event_type: str) -> None:
+        self._page.dispatch_event_calls.append(event_type)
 
     async def inner_text(self) -> str:
         return self._page.selected_option_text
@@ -284,6 +291,8 @@ class FakePage:
         self.option_nth_calls: list[int] = []
         self.option_wait_calls: list[dict[str, object]] = []
         self.option_wait_error: BaseException | None = None
+        self.select_wait_calls: list[dict[str, object]] = []
+        self.dispatch_event_calls: list[str] = []
         self.selected_option_text = "Закордонний паспорт та (або) ID-картка"
         self.expect_response_calls = 0
         self.expect_response_timeout: int | None = None
@@ -601,6 +610,8 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("option", page.locator_selectors)
         self.assertEqual(page.select_option_calls, [0, 1])
         self.assertEqual(page.select_option_timeout, 15_000)
+        self.assertEqual(page.select_wait_calls[0]["state"], "visible")
+        self.assertEqual(page.dispatch_event_calls, ["input", "change", "input", "change"])
         self.assertEqual(page.option_wait_calls[0]["state"], "attached")
         self.assertEqual(page.option_wait_calls[0]["timeout"], 10_000)
         self.assertEqual(page.expect_response_calls, 1)
@@ -749,6 +760,7 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, SlotStatus.FREE_SLOTS_AVAILABLE)
         self.assertEqual(page.wait_for_function_calls, 1)
+        self.assertGreaterEqual(page.wait_for_selector_calls, 1)
         self.assertEqual(page.select_option_calls, [0, 1])
         health = await scraper.get_health_snapshot()
         self.assertEqual(health.status, ScraperHealthStatus.READY)

@@ -671,6 +671,24 @@ class SlotScraper:
             "managed_challenge_cleared",
             extra={"city": self._settings.city_name},
         )
+        try:
+            await self._wait_for_queue_selector(page)
+        except PlaywrightTimeoutError:
+            logger.info(
+                "queue_ui_wait_after_challenge_timeout",
+                extra={
+                    "city": self._settings.city_name,
+                    "timeout_ms": _QUEUE_UI_WAIT_MS,
+                },
+            )
+        except PlaywrightError as exc:
+            if is_target_closed_error(exc) or self._page_is_closed(page):
+                raise TargetTabClosedError(
+                    "target tab closed while waiting for queue UI"
+                ) from exc
+            if is_execution_context_destroyed(exc):
+                return None
+            raise
         return None
 
     async def _wait_for_queue_selector(self, page: Page) -> None:
@@ -808,6 +826,10 @@ class SlotScraper:
 
     async def _select_first_service_attempt(self, page: Page) -> SlotCheckResult | None:
         select = page.locator("select").first
+        await select.wait_for(
+            state="visible",
+            timeout=_SERVICE_SELECT_TIMEOUT_MS,
+        )
         await select.locator("option").nth(_SERVICE_OPTION_INDEX).wait_for(
             state="attached",
             timeout=_SERVICE_OPTION_ATTACH_TIMEOUT_MS,
@@ -816,7 +838,12 @@ class SlotScraper:
             index=_SERVICE_PLACEHOLDER_INDEX,
             timeout=_SERVICE_SELECT_TIMEOUT_MS,
         )
+        await self._dispatch_select_events(select)
         return await self._await_service_validation(page, select)
+
+    async def _dispatch_select_events(self, select: Locator) -> None:
+        await select.dispatch_event("input")
+        await select.dispatch_event("change")
 
     async def _await_service_validation(
         self,
@@ -857,6 +884,7 @@ class SlotScraper:
                         index=_SERVICE_OPTION_INDEX,
                         timeout=_SERVICE_SELECT_TIMEOUT_MS,
                     )
+                    await self._dispatch_select_events(select)
                 response = await pending.value
             except PlaywrightTimeoutError:
                 logger.info(
