@@ -12,7 +12,9 @@ _DASH_RE = re.compile(r"[–—−]")
 OCCUPIED_HEADING = "вибачте, на даний момент всі місця зайняті!"
 SERVICE_LABEL = "послуга"
 SELECT_PLACEHOLDER = "- обрати -"
-RATE_LIMIT_MESSAGE = "too many requests, please try again later"
+RATE_LIMIT_MARKERS: tuple[str, ...] = (
+    "too many requests",
+)
 _SERVER_ERROR_VISIBLE_MARKERS: tuple[str, ...] = (
     "datetimezone",
     "500 internal server error",
@@ -77,8 +79,27 @@ def has_cloudflare_source(*, title: str = "", html: str = "") -> bool:
     )
 
 
+def has_rate_limit_source(
+    *,
+    title: str = "",
+    visible_text: str = "",
+    html: str = "",
+) -> bool:
+    blob = " ".join(
+        (
+            normalize_visible_text(title),
+            normalize_visible_text(visible_text),
+            normalize_visible_text(html),
+        )
+    )
+    return any(marker in blob for marker in RATE_LIMIT_MARKERS)
+
+
 def has_rate_limit_message(evidence: SlotPageEvidence) -> bool:
-    return RATE_LIMIT_MESSAGE in normalize_visible_text(evidence.visible_text)
+    return has_rate_limit_source(
+        title=evidence.title,
+        visible_text=evidence.visible_text,
+    )
 
 
 def has_server_error_source(

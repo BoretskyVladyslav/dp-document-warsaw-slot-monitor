@@ -10,6 +10,7 @@ from src.services.slot_parser import (
     classify_slot_evidence,
     has_cloudflare_source,
     has_rate_limit_message,
+    has_rate_limit_source,
     has_server_error_page,
     has_server_error_source,
     normalize_visible_text,
@@ -236,6 +237,14 @@ def test_stale_cloudflare_query_token_does_not_override_visible_form() -> None:
 def test_rate_limit_message_is_detected_case_insensitively() -> None:
     assert has_rate_limit_message(
         evidence(visible_text="TOO MANY REQUESTS,\nplease try again later")
+    )
+    assert has_rate_limit_message(
+        evidence(
+            visible_text="Too many requests, please try again later!     /g",
+        )
+    )
+    assert has_rate_limit_source(
+        html="Too many requests, please try again later!     /g",
     )
 
 

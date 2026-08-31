@@ -38,6 +38,7 @@ from src.services.slot_parser import (
     has_cloudflare_challenge,
     has_cloudflare_source,
     has_rate_limit_message,
+    has_rate_limit_source,
     has_server_error_page,
     has_server_error_source,
 )
@@ -258,7 +259,6 @@ class SlotScraper:
         self._browser: Browser | None = None
         self._operation_lock = asyncio.Lock()
         self._latched_failure: ScraperFailureCode | None = None
-        self._cf_hold_timed_out = False
         self._health = ScraperHealthSnapshot(
             status=ScraperHealthStatus.STOPPED,
             cdp_connected=False,
@@ -470,6 +470,10 @@ class SlotScraper:
             title, html = source
             if has_server_error_source(title=title, html=html):
                 return await self._emit_server_error(page)
+            if has_rate_limit_source(title=title, html=html):
+                raise RateLimitException(
+                    "Too many requests, please try again later"
+                )
         try:
             evidence = await collect_dom_evidence(page)
         except PlaywrightError as exc:
@@ -533,7 +537,6 @@ class SlotScraper:
         evidence: SlotPageEvidence,
     ) -> SlotCheckResult | None:
         if not has_cloudflare_challenge(evidence):
-            self._cf_hold_timed_out = False
             return None
         logger.warning(
             "managed_challenge_hold_timeout",
@@ -542,12 +545,14 @@ class SlotScraper:
                 "cf_persists": True,
             },
         )
-        if self._latched_failure is not None or self._cf_hold_timed_out:
+        if self._latched_failure is not None:
             raise CloudflareChallengeError(
                 "Cloudflare challenge page detected"
             )
-        self._cf_hold_timed_out = True
-        logger.warning("cloudflare_challenge_delayed_auto_resolve")
+        logger.warning(
+            "cloudflare_challenge_delayed_auto_resolve",
+            extra={"city": self._settings.city_name},
+        )
         return self._unknown_result(
             ScraperFailureCode.CLOUDFLARE_DELAYED,
             "CF outlasted hold, retrying next cycle",
@@ -556,7 +561,6 @@ class SlotScraper:
     async def _wait_out_managed_challenge(self, page: Page) -> SlotCheckResult | None:
         self._require_cdp_connected()
         if not await self._managed_challenge_present(page):
-            self._cf_hold_timed_out = False
             return None
         logger.info(
             "managed_challenge_hold",
@@ -606,7 +610,6 @@ class SlotScraper:
                 if is_execution_context_destroyed(retry_exc):
                     return None
                 raise
-        self._cf_hold_timed_out = False
         logger.info(
             "managed_challenge_cleared",
             extra={"city": self._settings.city_name},
