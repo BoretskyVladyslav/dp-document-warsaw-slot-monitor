@@ -16,6 +16,7 @@ class ScraperFailureCode(StrEnum):
     TARGET_TAB_MISSING = "target_tab_missing"
     TARGET_TAB_CLOSED = "target_tab_closed"
     CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
+    CLOUDFLARE_DELAYED = "cloudflare_delayed"
     NAVIGATION_TIMEOUT = "navigation_timeout"
     INCONCLUSIVE_PAGE = "inconclusive_page"
     SERVICE_VALIDATE_ERROR = "service_validate_error"

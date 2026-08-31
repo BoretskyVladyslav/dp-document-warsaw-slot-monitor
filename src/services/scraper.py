@@ -58,7 +58,7 @@ _SERVICE_OPTION_ATTACH_TIMEOUT_MS = 10_000
 _SERVICE_VALIDATE_RESPONSE_TIMEOUT_MS = 10_000
 _SUSPICIOUS_VALIDATE_SECONDS = 0.2
 _CF_INTERSTITIAL_HOLD_SECONDS = 10.0
-_CF_MANAGED_CHALLENGE_HOLD_MS = 10_000
+_CF_MANAGED_CHALLENGE_HOLD_MS = 15_000
 _QUEUE_UI_SELECTOR = "select"
 
 _MANAGED_CHALLENGE_CLEARED_JS = f"""
@@ -258,6 +258,7 @@ class SlotScraper:
         self._browser: Browser | None = None
         self._operation_lock = asyncio.Lock()
         self._latched_failure: ScraperFailureCode | None = None
+        self._cf_hold_timed_out = False
         self._health = ScraperHealthSnapshot(
             status=ScraperHealthStatus.STOPPED,
             cdp_connected=False,
@@ -453,7 +454,9 @@ class SlotScraper:
         immediate = await self._peek_terminal_page_state(page)
         if immediate is not None:
             return immediate
-        await self._wait_out_managed_challenge(page)
+        delayed = await self._wait_out_managed_challenge(page)
+        if delayed is not None:
+            return delayed
         await self._wait_for_queue_ui(page)
         select_result = await self._select_first_service(page)
         if select_result is not None:
@@ -525,10 +528,36 @@ class SlotScraper:
             raise
         return has_cloudflare_challenge(evidence)
 
-    async def _wait_out_managed_challenge(self, page: Page) -> None:
+    def _resolve_managed_challenge_timeout(
+        self,
+        evidence: SlotPageEvidence,
+    ) -> SlotCheckResult | None:
+        if not has_cloudflare_challenge(evidence):
+            self._cf_hold_timed_out = False
+            return None
+        logger.warning(
+            "managed_challenge_hold_timeout",
+            extra={
+                "city": self._settings.city_name,
+                "cf_persists": True,
+            },
+        )
+        if self._latched_failure is not None or self._cf_hold_timed_out:
+            raise CloudflareChallengeError(
+                "Cloudflare challenge page detected"
+            )
+        self._cf_hold_timed_out = True
+        logger.warning("cloudflare_challenge_delayed_auto_resolve")
+        return self._unknown_result(
+            ScraperFailureCode.CLOUDFLARE_DELAYED,
+            "CF outlasted hold, retrying next cycle",
+        )
+
+    async def _wait_out_managed_challenge(self, page: Page) -> SlotCheckResult | None:
         self._require_cdp_connected()
         if not await self._managed_challenge_present(page):
-            return
+            self._cf_hold_timed_out = False
+            return None
         logger.info(
             "managed_challenge_hold",
             extra={
@@ -543,11 +572,7 @@ class SlotScraper:
             )
         except PlaywrightTimeoutError:
             evidence = await collect_dom_evidence(page)
-            if has_cloudflare_challenge(evidence):
-                raise CloudflareChallengeError(
-                    "Cloudflare challenge page detected"
-                )
-            return
+            return self._resolve_managed_challenge_timeout(evidence)
         except PlaywrightError as exc:
             if is_target_closed_error(exc) or self._page_is_closed(page):
                 raise TargetTabClosedError(
@@ -572,23 +597,21 @@ class SlotScraper:
                 )
             except PlaywrightTimeoutError:
                 evidence = await collect_dom_evidence(page)
-                if has_cloudflare_challenge(evidence):
-                    raise CloudflareChallengeError(
-                        "Cloudflare challenge page detected"
-                    )
-                return
+                return self._resolve_managed_challenge_timeout(evidence)
             except PlaywrightError as retry_exc:
                 if is_target_closed_error(retry_exc) or self._page_is_closed(page):
                     raise TargetTabClosedError(
                         "target tab closed while waiting out Cloudflare challenge"
                     ) from retry_exc
                 if is_execution_context_destroyed(retry_exc):
-                    return
+                    return None
                 raise
+        self._cf_hold_timed_out = False
         logger.info(
             "managed_challenge_cleared",
             extra={"city": self._settings.city_name},
         )
+        return None
 
     async def _wait_for_queue_ui(self, page: Page) -> None:
         self._require_cdp_connected()
@@ -795,6 +818,14 @@ class SlotScraper:
                 ScraperFailureCode.SERVICE_VALIDATE_ERROR,
                 "service validation rejected",
             )
+        request = getattr(response, "request", None)
+        logger.info(
+            "service_validate_response_caught",
+            extra={
+                "method": getattr(request, "method", None),
+                "url": getattr(response, "url", ""),
+            },
+        )
         if elapsed < _SUSPICIOUS_VALIDATE_SECONDS:
             logger.warning(
                 "suspiciously_fast_validate_response",
@@ -820,7 +851,11 @@ class SlotScraper:
         self._require_cdp_connected()
         latched_failure = self._latched_failure
         latched_details = self._health.details
-        await self._wait_out_managed_challenge(page)
+        delayed = await self._wait_out_managed_challenge(page)
+        if delayed is not None:
+            raise CloudflareChallengeError(
+                "target tab still requires Cloudflare verification"
+            )
         evidence = await collect_dom_evidence(page)
         self._raise_if_rate_limited(evidence)
         if has_cloudflare_challenge(evidence):
