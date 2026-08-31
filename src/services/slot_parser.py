@@ -28,10 +28,15 @@ _SERVER_ERROR_HTML_MARKERS: tuple[str, ...] = (
 CF_TITLE_MARKERS: tuple[str, ...] = (
     "just a moment",
     "трохи зачекайте",
+    "waiting room",
 )
 CF_BODY_MARKERS: tuple[str, ...] = (
     "триває перевірка безпеки",
     "підтвердьте, що ви людина",
+    "вас додано до черги",
+    "waiting room",
+    "орієнтовний час очікування",
+    "віртуальну чергу",
 )
 
 

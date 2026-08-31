@@ -654,6 +654,47 @@ class StrictCdpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.reload_calls, 2)
         self.assertEqual(page.wait_for_function_calls, 3)
 
+    async def test_waiting_room_is_treated_as_cloudflare_challenge(self) -> None:
+        raw = {
+            "title": "Waiting Room",
+            "url": TARGET_URL,
+            "visibleText": (
+                "Вас додано до черги. Орієнтовний час очікування. "
+                "Ви у віртуальну чергу."
+            ),
+            "occupiedBannerVisible": False,
+            "serviceSelectVisible": False,
+            "selectPlaceholderVisible": False,
+            "telInputVisible": False,
+            "serviceOptionSelected": False,
+            "challengeVisible": False,
+        }
+        page = FakePage(TARGET_URL, raw)
+        page.html = (
+            "<h1>Waiting Room</h1>"
+            "<p>Вас додано до черги</p>"
+            "<p>Орієнтовний час очікування</p>"
+            "<p>віртуальну чергу</p>"
+        )
+        scraper = SlotScraper(settings())
+        scraper._browser = FakeBrowser([FakeContext([page])])  # type: ignore[assignment]
+
+        delayed = await scraper.check_availability()
+        self.assertEqual(delayed.status, SlotStatus.UNKNOWN)
+        self.assertEqual(
+            delayed.failure_code,
+            ScraperFailureCode.CLOUDFLARE_DELAYED,
+        )
+        self.assertEqual(page.wait_for_selector_calls, 0)
+        with self.assertRaises(CloudflareChallengeError):
+            await scraper.check_availability()
+        health = await scraper.get_health_snapshot()
+        self.assertEqual(health.status, ScraperHealthStatus.NEEDS_HUMAN)
+        self.assertEqual(
+            health.failure_code,
+            ScraperFailureCode.CLOUDFLARE_CHALLENGE,
+        )
+
     async def test_managed_challenge_clears_before_select(self) -> None:
         page = FakePage(TARGET_URL, challenge_evidence())
         page.wait_for_function_succeeds = True

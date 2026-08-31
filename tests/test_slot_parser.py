@@ -169,8 +169,13 @@ def test_occupied_banner_with_visible_form_is_no_slots() -> None:
     [
         evidence(title="Just a moment..."),
         evidence(title="Трохи зачекайте..."),
+        evidence(title="Waiting Room"),
         evidence(visible_text="Триває перевірка безпеки"),
         evidence(visible_text="Підтвердьте, що ви людина"),
+        evidence(visible_text="Вас додано до черги"),
+        evidence(visible_text="Cloudflare Waiting Room"),
+        evidence(visible_text="Орієнтовний час очікування: 5 хв"),
+        evidence(visible_text="Ви у віртуальну чергу"),
     ],
 )
 def test_cloudflare_signals_are_unknown(
@@ -203,6 +208,10 @@ def test_embedded_turnstile_iframe_is_not_a_challenge() -> None:
     )
     assert result.status is SlotStatus.FREE_SLOTS_AVAILABLE
     assert has_cloudflare_source(title="Трохи зачекайте...")
+    assert has_cloudflare_source(
+        html="Вас додано до черги. Орієнтовний час очікування.",
+    )
+    assert has_cloudflare_source(title="Waiting Room")
 
 
 def test_stale_cloudflare_query_token_does_not_override_visible_form() -> None:
