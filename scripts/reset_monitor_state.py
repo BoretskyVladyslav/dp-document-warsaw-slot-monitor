@@ -34,9 +34,9 @@ def _parse_database_path() -> Path:
 def reset_monitor_state(database_path: Path) -> None:
     if not database_path.exists():
         return
-    connection = sqlite3.connect(database_path)
+    connection = sqlite3.connect(database_path, timeout=5.0)
     try:
-        connection.busy_timeout = 5000
+        connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA foreign_keys = ON")
         tables = {
             str(row[0])
@@ -50,8 +50,11 @@ def reset_monitor_state(database_path: Path) -> None:
             )
         if "monitor_state" in tables:
             connection.execute("DELETE FROM monitor_state")
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         connection.commit()
+        try:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
     finally:
         connection.close()
 
