@@ -46,6 +46,16 @@ Optional settings:
 
 Never commit `.env`.
 
+## Polling
+
+A scheduled check waits `CHECK_INTERVAL_SECONDS` (default 300, allowed 15–3600), then adds a random offset from −15 to +15 seconds. The wait never drops below 15 seconds.
+
+Three `UNKNOWN` or server-error results in a row double the next wait (`check_interval_seconds * 2`) and send one circuit-breaker diagnostic. A verified `NO_SLOTS` or `FREE_SLOTS_AVAILABLE` result clears that streak.
+
+A visible rate-limit page starts a cooldown at 15 minutes, doubling up to 2 hours. Scheduled checks do not reload the tab while the cooldown is active.
+
+`/check_now` uses the same browser lock as the schedule. Each administrator can start at most one new manual check every 30 seconds.
+
 ## Quick start (Windows)
 
 Double-click these files from the project folder:
